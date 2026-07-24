@@ -1,0 +1,185 @@
+# Personal fork workflow: build an unsigned macOS DMG on GitHub-hosted runners
+# and publish it to a GitHub Release download URL.
+#
+# Why this exists: upstream Release/CI jobs use private Blacksmith runners and
+# org-only relay secrets, so they never start on personal forks. This workflow
+# only needs macos-latest + contents:write.
+#
+# Usage:
+#   1. Actions → "Personal macOS Release" → Run workflow
+#   2. Or push a tag: personal-v0.0.28-adi.3
+#   3. Download the DMG from the created GitHub Release
+name: Personal macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.0.28-adi.3). Empty = package.json version + -adi.<run_number>"
+        required: false
+        type: string
+      arch:
+        description: "macOS architecture to build"
+        required: false
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - x64
+      product_name:
+        description: "Desktop product name (side-by-side with official app)"
+        required: false
+        default: T3 Code Adi
+        type: string
+      app_id:
+        description: "macOS bundle id (must differ from official com.t3tools.t3code)"
+        required: false
+        default: com.t3tools.t3code.adi
+        type: string
+  push:
+    tags:
+      - "personal-v*"
+
+# Do not run on the upstream org (they have their own Release workflow).
+# Safe for personal forks that lack Blacksmith runners.
+permissions:
+  contents: write
+
+jobs:
+  build_and_release:
+    name: Build macOS DMG + publish release
+    if: github.repository_owner != 'pingdotgg'
+    runs-on: macos-latest
+    timeout-minutes: 75
+    env:
+      # Unsigned personal builds; script also sets CSC_IDENTITY_AUTO_DISCOVERY=false.
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - id: meta
+        name: Resolve release metadata
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_ARCH: ${{ github.event.inputs.arch }}
+          INPUT_PRODUCT_NAME: ${{ github.event.inputs.product_name }}
+          INPUT_APP_ID: ${{ github.event.inputs.app_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == personal-v* ]]; then
+            version="${GITHUB_REF_NAME#personal-v}"
+            arch="arm64"
+            product_name="T3 Code Adi"
+            app_id="com.t3tools.t3code.adi"
+          else
+            package_version="$(node -p "require('./apps/desktop/package.json').version")"
+            version="${INPUT_VERSION:-}"
+            if [[ -z "${version}" ]]; then
+              version="${package_version}-adi.${RUN_NUMBER}"
+            fi
+            version="${version#v}"
+            arch="${INPUT_ARCH:-arm64}"
+            product_name="${INPUT_PRODUCT_NAME:-T3 Code Adi}"
+            app_id="${INPUT_APP_ID:-com.t3tools.t3code.adi}"
+          fi
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].+)?$ ]]; then
+            echo "Invalid version '${version}'. Expected semver-like value (e.g. 0.0.28-adi.3)." >&2
+            exit 1
+          fi
+
+          tag="personal-v${version}"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "arch=${arch}"
+            echo "product_name=${product_name}"
+            echo "app_id=${app_id}"
+            echo "release_name=T3 Code Adi ${version} (${arch})"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Building personal release:"
+          echo "  version=${version}"
+          echo "  tag=${tag}"
+          echo "  arch=${arch}"
+          echo "  product_name=${product_name}"
+          echo "  app_id=${app_id}"
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ steps.meta.outputs.version }}"
+
+      - name: Build unsigned macOS DMG
+        env:
+          T3CODE_DESKTOP_APP_ID: ${{ steps.meta.outputs.app_id }}
+          T3CODE_DESKTOP_PRODUCT_NAME: ${{ steps.meta.outputs.product_name }}
+        run: |
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch "${{ steps.meta.outputs.arch }}" \
+            --build-version "${{ steps.meta.outputs.version }}" \
+            --verbose
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          copied=0
+          for pattern in \
+            "release/*.dmg" \
+            "release/*.zip" \
+            "release/*.blockmap" \
+            "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+              copied=$((copied + 1))
+            done
+          done
+          if [[ "${copied}" -eq 0 ]]; then
+            echo "No desktop artifacts found under release/" >&2
+            ls -la release || true
+            exit 1
+          fi
+          ls -lah release-publish
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.release_name }}
+          body: |
+            Personal unsigned macOS build from `${{ github.sha }}`.
+
+            - Product: `${{ steps.meta.outputs.product_name }}`
+            - Bundle id: `${{ steps.meta.outputs.app_id }}`
+            - Arch: `${{ steps.meta.outputs.arch }}`
+
+            Install tip: if Gatekeeper blocks the app, right-click the app → Open.
+          prerelease: true
+          make_latest: false
+          files: |
+            release-publish/*.dmg
+            release-publish/*.zip
+            release-publish/*.blockmap
+            release-publish/*.yml
+          fail_on_unmatched_files: false
+          token: ${{ secrets.GITHUB_TOKEN }}

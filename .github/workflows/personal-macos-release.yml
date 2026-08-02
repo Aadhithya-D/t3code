@@ -59,6 +59,10 @@ jobs:
     if: github.repository_owner != 'pingdotgg'
     runs-on: macos-latest
     timeout-minutes: 75
+    # Explicit job-level write so release publish works even when the repo
+    # default GITHUB_TOKEN permission is "read".
+    permissions:
+      contents: write
     env:
       # Unsigned personal builds; script also sets CSC_IDENTITY_AUTO_DISCOVERY=false.
       T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}

@@ -1,6 +1,5 @@
-import { KiroSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { KiroSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -8,6 +7,7 @@ import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeKiroTextGeneration } from "../../textGeneration/KiroTextGeneration.ts";
@@ -40,7 +40,6 @@ import {
 
 const decodeKiroSettings = Schema.decodeSync(KiroSettings);
 const DRIVER_KIND = ProviderDriverKind.make("kiro");
-const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
 const UPDATE = makeStaticProviderMaintenanceResolver(
   makeManualOnlyProviderMaintenanceCapabilities({
     provider: DRIVER_KIND,
@@ -49,6 +48,7 @@ const UPDATE = makeStaticProviderMaintenanceResolver(
 );
 
 export type KiroDriverEnv =
+  | BackgroundPolicy.BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
@@ -65,7 +65,7 @@ const withInstanceIdentity =
     readonly accentColor: string | undefined;
     readonly continuationGroupKey: string;
   }) =>
-  (snapshot: ServerProviderDraft) => ({
+  (snapshot: ServerProviderDraft): ServerProvider => ({
     ...snapshot,
     instanceId: input.instanceId,
     driver: DRIVER_KIND,
@@ -84,6 +84,7 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
   defaultConfig: (): KiroSettings => decodeKiroSettings({}),
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
@@ -113,6 +114,7 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
       const textGeneration = yield* makeKiroTextGeneration(effectiveConfig, processEnv);
       const checkProvider = checkKiroProviderStatus(effectiveConfig, processEnv).pipe(
         Effect.map(stampIdentity),
+        Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
@@ -132,7 +134,6 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
             publishSnapshot,
             httpClient,
           }),
-        refreshInterval: SNAPSHOT_REFRESH_INTERVAL,
       }).pipe(
         Effect.mapError(
           (cause) =>

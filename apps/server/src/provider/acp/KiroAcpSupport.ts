@@ -1,5 +1,6 @@
 import { type KiroSettings, ProviderDriverKind } from "@t3tools/contracts";
 import { normalizeModelSlug } from "@t3tools/shared/model";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
@@ -54,7 +55,7 @@ export const makeKiroAcpRuntime = (
 ): Effect.Effect<
   AcpSessionRuntime.AcpSessionRuntime["Service"],
   EffectAcpErrors.AcpError,
-  Scope.Scope
+  Crypto.Crypto | Scope.Scope
 > =>
   Effect.gen(function* () {
     const acpContext = yield* Layer.build(

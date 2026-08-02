@@ -1,12 +1,12 @@
 import {
   type KiroSettings,
   type ModelCapabilities,
-  ProviderDriverKind,
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -37,7 +37,6 @@ const KIRO_PRESENTATION = {
   showInteractionModeToggle: false,
   requiresNewThreadForModelChange: false,
 } as const;
-const PROVIDER = ProviderDriverKind.make("kiro");
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
@@ -57,12 +56,7 @@ function kiroModelsFromSettings(
   customModels: ReadonlyArray<string> | undefined,
   builtInModels: ReadonlyArray<ServerProviderModel> = KIRO_BUILT_IN_MODELS,
 ): ReadonlyArray<ServerProviderModel> {
-  return providerModelsFromSettings(
-    builtInModels,
-    PROVIDER,
-    customModels ?? [],
-    EMPTY_CAPABILITIES,
-  );
+  return providerModelsFromSettings(builtInModels, customModels ?? [], EMPTY_CAPABILITIES);
 }
 
 export function buildInitialKiroProviderSnapshot(
@@ -160,7 +154,11 @@ const runKiroVersionCommand = (
 export const checkKiroProviderStatus = Effect.fn("checkKiroProviderStatus")(function* (
   settings: KiroSettings,
   environment: NodeJS.ProcessEnv = process.env,
-): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
+): Effect.fn.Return<
+  ServerProviderDraft,
+  never,
+  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
+> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = kiroModelsFromSettings(settings.customModels);
   if (!settings.enabled) {

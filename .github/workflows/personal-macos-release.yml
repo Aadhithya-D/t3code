@@ -1,14 +1,22 @@
 # Personal fork workflow: build an unsigned macOS DMG on GitHub-hosted runners
-# and publish it to a GitHub Release download URL.
+# and publish it to a GitHub Release that the desktop app can auto-update from.
 #
 # Why this exists: upstream Release/CI jobs use private Blacksmith runners and
 # org-only relay secrets, so they never start on personal forks. This workflow
 # only needs macos-latest + contents:write.
 #
+# In-app updates:
+#   Builds bake T3CODE_DESKTOP_UPDATE_REPOSITORY=$GITHUB_REPOSITORY into the app, so
+#   "T3 Code Adi" checks this fork's releases (not pingdotgg/t3code).
+#   Releases MUST be full (non-prerelease) + latest so electron-updater's
+#   /releases/latest endpoint can find them on the "latest" channel.
+#
 # Usage:
 #   1. Actions → "Personal macOS Release" → Run workflow
 #   2. Or push a tag: personal-v0.0.28-adi.3
-#   3. Download the DMG from the created GitHub Release
+#   3. First install: download the DMG from the GitHub Release once
+#   4. Later versions: open T3 Code Adi → Check for Updates (or wait for the
+#      rocket update button) — no manual DMG download needed
 name: Personal macOS Release
 
 on:
@@ -174,8 +182,13 @@ jobs:
             - Arch: `${{ steps.meta.outputs.arch }}`
 
             Install tip: if Gatekeeper blocks the app, right-click the app → Open.
-          prerelease: true
-          make_latest: false
+
+            After the first install, later personal builds appear as in-app updates
+            (this release is a full "latest" so electron-updater can find it).
+          # Full release (not prerelease): electron-updater on the "latest" channel
+          # only queries GitHub /releases/latest, which ignores prereleases.
+          prerelease: false
+          make_latest: true
           files: |
             release-publish/*.dmg
             release-publish/*.zip

@@ -228,7 +228,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(delta.payload.delta, "hello from mock");
-        assert.match(String(delta.itemId), /^assistant:mock-session-1:[a-z0-9-]+:segment:0$/);
+        assert.match(String(delta.itemId), /^assistant:mock-session-1:runtime:[^:]+:segment:0$/);
       }
 
       const assistantCompleted = runtimeEvents.find(
@@ -738,7 +738,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
             assert.equal(contentDelta.payload.delta, "hello from mock");
             assert.match(
               String(contentDelta.itemId),
-              /^assistant:mock-session-1:[a-z0-9-]+:segment:0$/,
+              /^assistant:mock-session-1:runtime:[^:]+:segment:0$/,
             );
           }
         });

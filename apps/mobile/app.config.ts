@@ -1,5 +1,6 @@
 import type { ExpoConfig } from "expo/config";
 
+import { BRAND_ASSET_PATHS } from "../../scripts/lib/brand-assets.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
 type AppVariant = "development" | "preview" | "production";
@@ -13,6 +14,8 @@ const isIosPersonalTeamBuild = repoEnv.T3CODE_IOS_PERSONAL_TEAM === "1";
 const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?.trim();
 const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 
+const fromRepoRoot = (relativePath: string) => `../../${relativePath}`;
+
 if (
   isIosPersonalTeamBuild &&
   (!personalTeamBundleIdentifier ||
@@ -24,20 +27,31 @@ if (
 }
 
 const DEVELOPMENT_ASSETS = {
-  appIcon: "./assets/splash-icon-dev.png",
-  iosIcon: "./assets/icon-composer-dev.icon",
-  splashIcon: "./assets/splash-icon-dev.png",
-  androidAdaptiveForeground: "./assets/android-icon-dev-foreground.png",
+  appIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
+  iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIconComposerProject),
+  splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
+  androidAdaptiveForeground: fromRepoRoot(BRAND_ASSET_PATHS.developmentUniversalIconPng),
   androidAdaptiveBackgroundColor: "#00639B",
   androidMonochromeIcon: "./assets/android-icon-mark.png",
   androidNotificationIcon: "./assets/android-notification-icon.png",
   androidNotificationColor: "#00639B",
 } as const;
 
+const PREVIEW_ASSETS = {
+  appIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIosIconPng),
+  iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIconComposerProject),
+  splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIosIconPng),
+  androidAdaptiveForeground: fromRepoRoot(BRAND_ASSET_PATHS.nightlyLinuxIconPng),
+  androidAdaptiveBackgroundColor: "#111533",
+  androidMonochromeIcon: "./assets/android-icon-mark.png",
+  androidNotificationIcon: "./assets/android-notification-icon.png",
+  androidNotificationColor: "#7565C7",
+} as const;
+
 const RELEASE_ASSETS = {
-  appIcon: "./assets/splash-icon-prod.png",
-  iosIcon: "./assets/icon-composer-prod.icon",
-  splashIcon: "./assets/splash-icon-prod.png",
+  appIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIosIconPng),
+  iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIconComposerProject),
+  splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIosIconPng),
   androidAdaptiveForeground: "./assets/android-icon-mark.png",
   androidAdaptiveBackgroundColor: "#000000",
   androidMonochromeIcon: "./assets/android-icon-mark.png",
@@ -60,7 +74,7 @@ const VARIANT_CONFIG = {
     iosBundleIdentifier: "com.t3tools.t3code.preview",
     androidPackage: "com.t3tools.t3code.preview",
     relyingParty: "clerk.t3.codes",
-    assets: RELEASE_ASSETS,
+    assets: PREVIEW_ASSETS,
   },
   production: {
     appName: "T3 Code",
@@ -147,7 +161,7 @@ const config: ExpoConfig = {
   slug: "t3-code",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
-  version: "0.1.0",
+  version: "1.0.1",
   runtimeVersion: {
     // Fingerprint (not appVersion) so an OTA only reaches binaries whose native
     // project — native deps, config plugins, AND patches/ — matches the update.
@@ -167,6 +181,9 @@ const config: ExpoConfig = {
   ios: {
     icon: variant.assets.iosIcon,
     supportsTablet: true,
+    // Multitasking-capable iPad apps cannot rotate programmatically, so the
+    // showcase capture build requires full screen (see infoPlist below).
+    requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
     // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
     // does not fall back to a personal team (which cannot sign app groups,
@@ -183,6 +200,21 @@ const config: ExpoConfig = {
       NSLocalNetworkUsageDescription:
         "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
       ITSAppUsesNonExemptEncryption: false,
+      // The App Store screenshot harness rotates the iPad interface from
+      // inside the app (CI denies osascript the Accessibility access that
+      // Simulator menu scripting needs), and iPadOS ignores programmatic
+      // orientation requests for multitasking-capable apps — so the capture
+      // build opts out of multitasking and declares landscape support.
+      ...(process.env.T3_SHOWCASE_CAPTURE_BUILD === "1"
+        ? {
+            "UISupportedInterfaceOrientations~ipad": [
+              "UIInterfaceOrientationPortrait",
+              "UIInterfaceOrientationPortraitUpsideDown",
+              "UIInterfaceOrientationLandscapeLeft",
+              "UIInterfaceOrientationLandscapeRight",
+            ],
+          }
+        : {}),
     },
   },
   android: {
@@ -261,10 +293,12 @@ const config: ExpoConfig = {
       "expo-camera",
       {
         cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
       },
     ],
+    ["expo-image-picker", { photosPermission: false, microphonePermission: false }],
     [
       "expo-splash-screen",
       {

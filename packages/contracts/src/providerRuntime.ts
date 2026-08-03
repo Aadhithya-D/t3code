@@ -320,6 +320,13 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
   toolUses: Schema.optional(NonNegativeInt),
   durationMs: Schema.optional(NonNegativeInt),
   compactsAutomatically: Schema.optional(Schema.Boolean),
+  /**
+   * Provider-reported metered cost for the last completed turn (e.g. Kiro CLI
+   * credits). Fractional values are allowed; UI formats them for display.
+   */
+  creditsUsed: Schema.optional(Schema.Number),
+  /** Unit label for `creditsUsed` (e.g. "credits"). */
+  creditsUnit: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type ThreadTokenUsageSnapshot = typeof ThreadTokenUsageSnapshot.Type;
 

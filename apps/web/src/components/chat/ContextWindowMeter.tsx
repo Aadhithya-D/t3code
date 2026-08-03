@@ -1,5 +1,9 @@
 import { cn } from "~/lib/utils";
-import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
+import {
+  type ContextWindowSnapshot,
+  formatContextWindowTokens,
+  formatCreditsUsed,
+} from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 
 function formatPercentage(value: number | null): string | null {
@@ -24,6 +28,8 @@ export function ContextWindowMeter(props: {
   const dashOffset = circumference - (normalizedPercentage / 100) * circumference;
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
+  const creditsLabel = formatCreditsUsed(usage.creditsUsed);
+  const creditsUnit = usage.creditsUnit?.trim() || "credits";
   const isOverloaded = normalizedPercentage > 90;
   const usageColor = isOverloaded
     ? "var(--color-red-500)"
@@ -124,6 +130,14 @@ export function ContextWindowMeter(props: {
               <span className="text-muted-foreground/60">Total processed</span>
               <span className="font-medium tabular-nums text-muted-foreground/80">
                 {formatContextWindowTokens(totalProcessedTokens)}
+              </span>
+            </div>
+          ) : null}
+          {creditsLabel !== null ? (
+            <div className="flex items-center justify-between gap-3 text-[11px] leading-4">
+              <span className="text-muted-foreground/60">Last turn</span>
+              <span className="font-medium tabular-nums text-muted-foreground/80">
+                {creditsLabel} {creditsUnit}
               </span>
             </div>
           ) : null}

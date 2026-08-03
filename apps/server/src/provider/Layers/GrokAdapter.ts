@@ -73,6 +73,12 @@ import {
   promptResponseHasMissingXAiStopReason,
   XAiAskUserQuestionRequest,
 } from "../acp/XAiAcpExtension.ts";
+import {
+  isPromptAlreadyInProgressMessage,
+  KIRO_DEV_METADATA_METHOD,
+  KiroDevMetadataNotification,
+  threadTokenUsageFromKiroMetadata,
+} from "../acp/KiroAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -744,6 +750,37 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 ),
               { discard: true },
             );
+            // Kiro (and other agents reusing this adapter) stream context/credit
+            // usage over a private extension notification rather than ACP
+            // usage_update. Map it into the shared token-usage event for the meter.
+            yield* acp.handleExtNotification(
+              KIRO_DEV_METADATA_METHOD,
+              KiroDevMetadataNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_DEV_METADATA_METHOD, params);
+                    const usage = threadTokenUsageFromKiroMetadata(params);
+                    if (!usage) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    yield* offerRuntimeEvent({
+                      type: "thread.token-usage.updated",
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      ...(turnId !== undefined ? { turnId } : {}),
+                      payload: { usage },
+                      raw: {
+                        source: "acp.kiro.extension",
+                        method: KIRO_DEV_METADATA_METHOD,
+                        payload: params,
+                      },
+                    });
+                  }),
+                ),
+            );
             yield* acp.handleRequestPermission((params) =>
               mapAcpCallbackFailure(
                 Effect.gen(function* () {
@@ -1284,27 +1321,57 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const promptFailureMessageRef = yield* Ref.make<string | undefined>(undefined);
 
         return yield* Effect.gen(function* () {
-          const result = yield* prepared.acp
+          /**
+           * Kiro (and similar ACP agents) reject a follow-up prompt while they
+           * still consider the previous one in flight — common right after
+           * Stop/cancel while residual tools finish. Cancel once more, give
+           * the agent a short settle window, and retry a single time so multi-
+           * turn chat does not fail with "unable to start turn".
+           */
+          const runPromptWithBusyRetry = prepared.acp
             .prompt({
               prompt: prepared.promptParts,
             })
             .pipe(
-              Effect.tap((promptResult) =>
-                Effect.all([
-                  Ref.set(promptRpcSucceeded, true),
-                  Ref.set(promptResultRef, promptResult),
-                ]),
-              ),
-              Effect.tapError((error) =>
-                Ref.set(
-                  promptFailureMessageRef,
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
-                ).pipe(Effect.andThen(prepared.acp.drainEvents)),
-              ),
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
+              Effect.catch((error) => {
+                const mapped = mapAcpToAdapterError(
+                  PROVIDER,
+                  input.threadId,
+                  "session/prompt",
+                  error,
+                );
+                if (!isPromptAlreadyInProgressMessage(mapped.message)) {
+                  return Effect.fail(error);
+                }
+                return prepared.acp.cancel.pipe(
+                  Effect.ignore,
+                  Effect.andThen(Effect.sleep(Duration.millis(750))),
+                  Effect.andThen(
+                    prepared.acp.prompt({
+                      prompt: prepared.promptParts,
+                    }),
+                  ),
+                );
+              }),
             );
+
+          const result = yield* runPromptWithBusyRetry.pipe(
+            Effect.tap((promptResult) =>
+              Effect.all([
+                Ref.set(promptRpcSucceeded, true),
+                Ref.set(promptResultRef, promptResult),
+              ]),
+            ),
+            Effect.tapError((error) =>
+              Ref.set(
+                promptFailureMessageRef,
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
+              ).pipe(Effect.andThen(prepared.acp.drainEvents)),
+            ),
+            Effect.mapError((error) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+            ),
+          );
 
           return yield* withThreadLock(
             input.threadId,

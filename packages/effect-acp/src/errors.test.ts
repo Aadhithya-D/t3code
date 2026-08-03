@@ -57,6 +57,40 @@ describe("effect-acp errors", () => {
     });
   });
 
+  it.effect("includes string protocol error data in the public message", () => {
+    const failure = AcpSchema.Error.make({
+      code: -32603,
+      message: "Internal error",
+      data: "Prompt already in progress",
+    });
+
+    return Effect.gen(function* () {
+      const error = yield* callRpc("session/prompt", Effect.fail(failure)).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "AcpRequestError",
+        code: -32603,
+        data: "Prompt already in progress",
+        method: "session/prompt",
+      });
+      expect(error.message).toBe("Internal error: Prompt already in progress");
+    });
+  });
+
+  it.effect("maps defects during RPC into typed request errors", () => {
+    return Effect.gen(function* () {
+      const error = yield* callRpc("session/prompt", Effect.die(new Error("Internal error"))).pipe(
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "AcpRequestError",
+        method: "session/prompt",
+      });
+      expect(error.message).toBe("Internal error");
+    });
+  });
+
   it("does not expose legacy diagnostic detail as the transport message", () => {
     const cause = new Error("connection refused at a private endpoint");
     const error = new AcpError.AcpTransportError({

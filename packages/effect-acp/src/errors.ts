@@ -201,6 +201,27 @@ export class AcpRequestError extends Schema.TaggedErrorClass<AcpRequestError>()(
     return this.errorMessage;
   }
 
+  /**
+   * Agents often put the actionable detail in `error.data` while leaving
+   * `error.message` as a generic JSON-RPC label (e.g. Kiro: message
+   * "Internal error", data "Prompt already in progress"). Prefer a combined
+   * message when data is a short public string so callers do not have to dig
+   * into `data` themselves.
+   */
+  static formatProtocolErrorMessage(error: AcpSchema.Error): string {
+    const base = error.message.trim() || "Internal error";
+    if (typeof error.data !== "string") {
+      return base;
+    }
+    const detail = error.data.trim();
+    if (detail.length === 0 || detail === base) {
+      return base;
+    }
+    // Cap so a huge data blob cannot become a multi-KB toast.
+    const capped = detail.length > 500 ? `${detail.slice(0, 500)}…` : detail;
+    return `${base}: ${capped}`;
+  }
+
   static fromProtocolError(
     error: AcpSchema.Error,
     context: {
@@ -211,7 +232,7 @@ export class AcpRequestError extends Schema.TaggedErrorClass<AcpRequestError>()(
   ) {
     return new AcpRequestError({
       code: error.code,
-      errorMessage: error.message,
+      errorMessage: AcpRequestError.formatProtocolErrorMessage(error),
       ...(error.data !== undefined ? { data: error.data } : {}),
       method: context.method,
       ...(context.requestId === undefined ? {} : { requestId: context.requestId }),

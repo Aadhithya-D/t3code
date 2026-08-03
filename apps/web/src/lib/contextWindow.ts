@@ -38,6 +38,10 @@ export function formatProviderDisplayName(provider: string | null | undefined): 
       return "Cursor";
     case "opencode":
       return "OpenCode";
+    case "kiro":
+      return "Kiro";
+    case "grok":
+      return "Grok";
     default: {
       // Title-case unknown driver kinds so they read reasonably.
       const trimmed = provider.replace(/Agent$/i, "").trim();
@@ -69,6 +73,13 @@ export function deriveLatestContextWindowSnapshot(
       maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
     const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
 
+    const creditsUsed = asFiniteNumber(payload?.creditsUsed);
+    const creditsUnitRaw = payload?.creditsUnit;
+    const creditsUnit =
+      typeof creditsUnitRaw === "string" && creditsUnitRaw.trim().length > 0
+        ? creditsUnitRaw.trim()
+        : null;
+
     return {
       usedTokens,
       totalProcessedTokens: asFiniteNumber(payload?.totalProcessedTokens),
@@ -88,6 +99,8 @@ export function deriveLatestContextWindowSnapshot(
       toolUses: asFiniteNumber(payload?.toolUses),
       durationMs: asFiniteNumber(payload?.durationMs),
       compactsAutomatically: asBoolean(payload?.compactsAutomatically) ?? false,
+      creditsUsed,
+      creditsUnit,
       updatedAt: activity.createdAt,
     };
   }
@@ -109,4 +122,21 @@ export function formatContextWindowTokens(value: number | null): string {
     return `${Math.round(value / 1_000)}k`;
   }
   return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+}
+
+/** Format provider-reported credits (e.g. Kiro metering) for the context meter. */
+export function formatCreditsUsed(value: number | null | undefined): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  if (value === 0) {
+    return "0";
+  }
+  if (value < 0.01) {
+    return value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  }
+  if (value < 10) {
+    return value.toFixed(2).replace(/\.?0+$/, "");
+  }
+  return value.toFixed(1).replace(/\.0$/, "");
 }

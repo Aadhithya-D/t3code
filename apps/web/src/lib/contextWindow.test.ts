@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { EventId, type OrchestrationThreadActivity, TurnId } from "@t3tools/contracts";
 
-import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "./contextWindow";
+import {
+  deriveLatestContextWindowSnapshot,
+  formatContextWindowTokens,
+  formatCreditsUsed,
+} from "./contextWindow";
 
 function makeActivity(id: string, kind: string, payload: unknown): OrchestrationThreadActivity {
   return {
@@ -80,5 +84,21 @@ describe("contextWindow", () => {
 
     expect(snapshot?.usedTokens).toBe(81_659);
     expect(snapshot?.totalProcessedTokens).toBe(748_126);
+  });
+
+  it("includes credits from Kiro-style usage payloads", () => {
+    const snapshot = deriveLatestContextWindowSnapshot([
+      makeActivity("activity-1", "context-window.updated", {
+        usedTokens: 1_733,
+        maxTokens: 100_000,
+        creditsUsed: 0.121,
+        creditsUnit: "credits",
+      }),
+    ]);
+
+    expect(snapshot?.creditsUsed).toBe(0.121);
+    expect(snapshot?.creditsUnit).toBe("credits");
+    expect(formatCreditsUsed(0.121)).toBe("0.12");
+    expect(formatCreditsUsed(0.0012)).toBe("0.0012");
   });
 });

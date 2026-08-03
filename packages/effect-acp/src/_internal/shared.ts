@@ -1,10 +1,45 @@
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { RpcClientError } from "effect/unstable/rpc";
 
 import * as AcpSchema from "../_generated/schema.gen.ts";
 import * as AcpError from "../errors.ts";
 const isError = Schema.is(AcpSchema.Error);
+
+function messageFromUnknown(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
+  }
+  if (value instanceof Error && value.message.trim().length > 0) {
+    return value.message.trim();
+  }
+  if (value && typeof value === "object" && "message" in value) {
+    const message = (value as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim().length > 0) {
+      return message.trim();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Some agent stacks (notably Kiro) surface protocol failures as defects rather
+ * than typed JSON-RPC errors. Prefer a typed request failure so adapters can
+ * map and retry instead of dying with an opaque "prompt request failed".
+ */
+function requestErrorFromDefect(method: string, defect: unknown): AcpError.AcpRequestError {
+  return AcpError.AcpRequestError.internalError(
+    messageFromUnknown(defect) ?? "Internal error",
+    defect,
+    {
+      method,
+      operation: "receive-response",
+      cause: defect,
+    },
+  );
+}
 
 export const callRpc = <A>(
   method: string,
@@ -23,6 +58,17 @@ export const callRpc = <A>(
             cause,
           }),
         ),
+    }),
+    Effect.catchCause((cause) => {
+      // Keep typed Fail errors as-is; only rewrite pure defects.
+      if (Cause.hasFails(cause) || !Cause.hasDies(cause)) {
+        return Effect.failCause(cause);
+      }
+      const defectResult = Cause.findDefect(cause);
+      if (Result.isFailure(defectResult)) {
+        return Effect.failCause(cause);
+      }
+      return Effect.fail(requestErrorFromDefect(method, defectResult.success));
     }),
   );
 

@@ -1,6 +1,11 @@
 import { type KiroSettings, ProviderDriverKind, type ProviderInstanceId } from "@t3tools/contracts";
 
-import { makeKiroAcpRuntime, resolveKiroAcpModelId } from "../acp/KiroAcpSupport.ts";
+import {
+  applyKiroAcpEffortChange,
+  makeKiroAcpRuntime,
+  resolveKiroAcpModelId,
+  resolveKiroEffortFromModelSelection,
+} from "../acp/KiroAcpSupport.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { makeGrokAdapter } from "./GrokAdapter.ts";
 
@@ -15,6 +20,9 @@ export interface KiroAdapterLiveOptions {
  * Kiro uses standard ACP session, model, permission, streaming, and
  * cancellation methods, so it shares the existing hardened ACP lifecycle
  * implementation instead of maintaining a third copy of that state machine.
+ *
+ * Effort is a Kiro-only trait: spawn with `--effort` on session start, and
+ * apply mid-session changes via `/effort` when the composer toggle changes.
  */
 export function makeKiroAdapter(kiroSettings: KiroSettings, options?: KiroAdapterLiveOptions) {
   return makeGrokAdapter(kiroSettings, {
@@ -22,10 +30,17 @@ export function makeKiroAdapter(kiroSettings: KiroSettings, options?: KiroAdapte
     provider: ProviderDriverKind.make("kiro"),
     providerDisplayName: "Kiro",
     resolveModelId: resolveKiroAcpModelId,
-    makeAcpRuntime: ({ grokSettings: _grokSettings, ...input }) =>
+    resolveSessionEffort: resolveKiroEffortFromModelSelection,
+    applySessionEffort: ({ runtime, effort }) =>
+      applyKiroAcpEffortChange({
+        runtime,
+        effort,
+      }),
+    makeAcpRuntime: ({ grokSettings: _grokSettings, initialEffort, ...input }) =>
       makeKiroAcpRuntime({
         ...input,
         kiroSettings,
+        ...(initialEffort ? { initialEffort } : {}),
       }),
   });
 }

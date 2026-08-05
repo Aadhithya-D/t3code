@@ -112,6 +112,11 @@ function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   return Exit.isSuccess(result) ? result.value : undefined;
 }
 
+type GrokAcpRuntimeFactoryInput = Parameters<typeof makeGrokAcpRuntime>[0] & {
+  /** Optional initial thinking effort for providers that support it (e.g. Kiro). */
+  readonly initialEffort?: string | null | undefined;
+};
+
 export interface GrokAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
@@ -123,8 +128,34 @@ export interface GrokAdapterLiveOptions {
    */
   readonly provider?: ProviderDriverKind;
   readonly providerDisplayName?: string;
-  readonly makeAcpRuntime?: typeof makeGrokAcpRuntime;
+  readonly makeAcpRuntime?: (
+    input: GrokAcpRuntimeFactoryInput,
+  ) => ReturnType<typeof makeGrokAcpRuntime>;
   readonly resolveModelId?: (model: string | null | undefined) => string | undefined;
+  /**
+   * Optional provider-specific thinking effort from the composer model selection.
+   * When set, the adapter passes it into `makeAcpRuntime` as `initialEffort` and
+   * re-applies mid-session via `applySessionEffort` when the value changes.
+   */
+  readonly resolveSessionEffort?: (
+    modelSelection:
+      | {
+          readonly model?: string | null | undefined;
+          readonly options?:
+            | ReadonlyArray<{
+                readonly id: string;
+                readonly value: string | boolean;
+              }>
+            | null
+            | undefined;
+        }
+      | null
+      | undefined,
+  ) => string | undefined;
+  readonly applySessionEffort?: (input: {
+    readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "prompt" | "cancel">;
+    readonly effort: string;
+  }) => Effect.Effect<void>;
 }
 
 interface PendingApproval {
@@ -158,6 +189,13 @@ interface GrokSessionContext {
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
   currentModelId: string | undefined;
+  /** Last applied thinking effort for providers that expose one (e.g. Kiro). */
+  currentEffort: string | undefined;
+  /**
+   * When true, skip streaming content/plan/tool runtime events so internal
+   * control prompts (e.g. `/effort high`) do not pollute the chat transcript.
+   */
+  suppressContentEvents: boolean;
   stopped: boolean;
   /** Epoch millis of the last ACP activity (turn start or inbound update).
    * Used by the idle watchdog to detect an agent that went silent mid-turn. */
@@ -278,6 +316,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
     const providerDisplayName = options?.providerDisplayName ?? "Grok";
     const makeAcpRuntime = options?.makeAcpRuntime ?? makeGrokAcpRuntime;
     const resolveModelId = options?.resolveModelId ?? resolveGrokAcpBaseModelId;
+    const resolveSessionEffort = options?.resolveSessionEffort;
+    const applySessionEffort = options?.applySessionEffort;
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make(PROVIDER);
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -657,6 +697,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const initialEffort = resolveSessionEffort?.(providerModelSelection);
           const acp = yield* makeAcpRuntime({
             grokSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -664,6 +705,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             cwd,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
+            ...(initialEffort ? { initialEffort } : {}),
             ...(mcpSession
               ? {
                   mcpServers: [
@@ -760,6 +802,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapAcpCallbackFailure(
                   Effect.gen(function* () {
                     yield* logNative(input.threadId, KIRO_DEV_METADATA_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    const reportedEffort = params.effort?.trim().toLowerCase();
+                    if (liveCtx && reportedEffort) {
+                      liveCtx.currentEffort = reportedEffort;
+                    }
                     const usage = threadTokenUsageFromKiroMetadata(params);
                     if (!usage) {
                       return;
@@ -951,6 +998,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             interruptedTurnIds: new Set(),
             promptsInFlight: 0,
             currentModelId: boundModelId,
+            currentEffort: initialEffort,
+            suppressContentEvents: false,
             stopped: false,
             lastActivityAtMillis: yield* Clock.currentTimeMillis,
             activeTurnProducedOutput: false,
@@ -978,7 +1027,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 const notificationTurnId = resolveNotificationTurnId(ctx);
                 if (
                   notificationTurnId === undefined ||
-                  ctx.interruptedTurnIds.has(notificationTurnId)
+                  ctx.interruptedTurnIds.has(notificationTurnId) ||
+                  ctx.suppressContentEvents
                 ) {
                   return;
                 }
@@ -1201,6 +1251,25 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapError: (cause) =>
                   mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
               });
+
+              const requestedEffort = resolveSessionEffort?.(turnModelSelection);
+              if (requestedEffort && applySessionEffort && requestedEffort !== ctx.currentEffort) {
+                // Hide the internal `/effort` confirmation message from chat.
+                ctx.suppressContentEvents = true;
+                yield* applySessionEffort({
+                  runtime: ctx.acp,
+                  effort: requestedEffort,
+                }).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      ctx.suppressContentEvents = false;
+                    }),
+                  ),
+                );
+                ctx.currentEffort = requestedEffort;
+              } else if (requestedEffort && !ctx.currentEffort) {
+                ctx.currentEffort = requestedEffort;
+              }
 
               const text = input.input?.trim();
               const imagePromptParts = yield* Effect.forEach(

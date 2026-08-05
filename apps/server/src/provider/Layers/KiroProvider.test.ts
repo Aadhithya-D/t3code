@@ -4,9 +4,30 @@ import { KiroSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { buildInitialKiroProviderSnapshot, checkKiroProviderStatus } from "./KiroProvider.ts";
+import {
+  buildInitialKiroProviderSnapshot,
+  buildKiroEffortCapabilities,
+  checkKiroProviderStatus,
+} from "./KiroProvider.ts";
 
 const decodeKiroSettings = Schema.decodeSync(KiroSettings);
+
+describe("buildKiroEffortCapabilities", () => {
+  it("advertises the thinking effort toggle for the composer", () => {
+    const caps = buildKiroEffortCapabilities();
+    const effort = caps.optionDescriptors?.find((descriptor) => descriptor.id === "effort");
+    expect(effort?.type).toBe("select");
+    if (effort?.type !== "select") return;
+    expect(effort.options.map((option) => option.id)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(effort.currentValue).toBe("medium");
+  });
+});
 
 describe("buildInitialKiroProviderSnapshot", () => {
   it.effect("returns a pending enabled snapshot by default", () =>
@@ -16,6 +37,12 @@ describe("buildInitialKiroProviderSnapshot", () => {
       expect(snapshot.status).toBe("warning");
       expect(snapshot.message).toContain("Checking Kiro");
       expect(snapshot.models.map((model) => model.slug)).toEqual(["default"]);
+      const defaultModel = snapshot.models[0];
+      expect(defaultModel).toBeDefined();
+      const effort = defaultModel?.capabilities?.optionDescriptors?.find(
+        (descriptor) => descriptor.id === "effort",
+      );
+      expect(effort?.type).toBe("select");
     }),
   );
 });

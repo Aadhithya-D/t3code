@@ -34,10 +34,19 @@ const GROK_TIMEOUT_MS = 180_000;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
+type GrokTextAcpRuntimeFactoryInput = Parameters<typeof makeGrokAcpRuntime>[0] & {
+  readonly initialEffort?: string | null | undefined;
+};
+
 export interface GrokTextGenerationOptions {
   readonly providerDisplayName?: string;
-  readonly makeAcpRuntime?: typeof makeGrokAcpRuntime;
+  readonly makeAcpRuntime?: (
+    input: GrokTextAcpRuntimeFactoryInput,
+  ) => ReturnType<typeof makeGrokAcpRuntime>;
   readonly resolveModelId?: (model: string | null | undefined) => string | undefined;
+  readonly resolveSessionEffort?: (
+    modelSelection: ModelSelection | null | undefined,
+  ) => string | undefined;
 }
 
 export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(function* (
@@ -50,6 +59,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
   const providerDisplayName = options?.providerDisplayName ?? "Grok";
   const makeAcpRuntime = options?.makeAcpRuntime ?? makeGrokAcpRuntime;
   const resolveModelId = options?.resolveModelId ?? resolveGrokAcpBaseModelId;
+  const resolveSessionEffort = options?.resolveSessionEffort;
 
   const runGrokJson = <S extends Schema.Top>({
     operation,
@@ -70,6 +80,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
       const resolvedModel = resolveModelId(modelSelection.model);
+      const initialEffort = resolveSessionEffort?.(modelSelection);
       const outputRef = yield* Ref.make("");
       const runtime = yield* makeAcpRuntime({
         grokSettings,
@@ -77,6 +88,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
         childProcessSpawner: commandSpawner,
         cwd,
         clientInfo: { name: "t3-code-git-text", version: "0.0.0" },
+        ...(initialEffort ? { initialEffort } : {}),
       }).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
       yield* runtime.handleSessionUpdate((notification) => {

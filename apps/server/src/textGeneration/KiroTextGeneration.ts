@@ -1,6 +1,10 @@
 import type { KiroSettings } from "@t3tools/contracts";
 
-import { makeKiroAcpRuntime, resolveKiroAcpModelId } from "../provider/acp/KiroAcpSupport.ts";
+import {
+  makeKiroAcpRuntime,
+  resolveKiroAcpModelId,
+  resolveKiroEffortFromModelSelection,
+} from "../provider/acp/KiroAcpSupport.ts";
 import { makeGrokTextGeneration } from "./GrokTextGeneration.ts";
 
 export const makeKiroTextGeneration = (
@@ -10,9 +14,11 @@ export const makeKiroTextGeneration = (
   makeGrokTextGeneration(settings, environment, {
     providerDisplayName: "Kiro",
     resolveModelId: resolveKiroAcpModelId,
-    makeAcpRuntime: ({ grokSettings: _grokSettings, ...input }) =>
+    resolveSessionEffort: resolveKiroEffortFromModelSelection,
+    makeAcpRuntime: ({ grokSettings: _grokSettings, initialEffort, ...input }) =>
       makeKiroAcpRuntime({
         ...input,
         kiroSettings: settings,
+        ...(initialEffort ? { initialEffort } : {}),
       }),
   });

@@ -18,6 +18,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import {
+  buildSelectOptionDescriptor,
   buildServerProvider,
   isCommandMissingCause,
   parseGenericCliVersion,
@@ -29,7 +30,13 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
-import { makeKiroAcpRuntime, resolveKiroAcpModelId } from "../acp/KiroAcpSupport.ts";
+import {
+  KIRO_DEFAULT_EFFORT,
+  KIRO_EFFORT_LEVELS,
+  KIRO_EFFORT_OPTION_ID,
+  makeKiroAcpRuntime,
+  resolveKiroAcpModelId,
+} from "../acp/KiroAcpSupport.ts";
 
 const KIRO_PRESENTATION = {
   displayName: "Kiro",
@@ -37,9 +44,33 @@ const KIRO_PRESENTATION = {
   showInteractionModeToggle: false,
   requiresNewThreadForModelChange: false,
 } as const;
-const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
-  optionDescriptors: [],
-});
+
+const KIRO_EFFORT_LABELS: Record<(typeof KIRO_EFFORT_LEVELS)[number], string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+};
+
+/** Thinking effort toggle for every Kiro model (CLI: `--effort` / `/effort`). */
+export function buildKiroEffortCapabilities(): ModelCapabilities {
+  return createModelCapabilities({
+    optionDescriptors: [
+      buildSelectOptionDescriptor({
+        id: KIRO_EFFORT_OPTION_ID,
+        label: "Effort",
+        options: KIRO_EFFORT_LEVELS.map((value) =>
+          value === KIRO_DEFAULT_EFFORT
+            ? { value, label: KIRO_EFFORT_LABELS[value], isDefault: true }
+            : { value, label: KIRO_EFFORT_LABELS[value] },
+        ),
+      }),
+    ],
+  });
+}
+
+const KIRO_MODEL_CAPABILITIES: ModelCapabilities = buildKiroEffortCapabilities();
 const VERSION_PROBE_TIMEOUT_MS = 4_000;
 const KIRO_ACP_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 
@@ -48,7 +79,7 @@ const KIRO_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     slug: "default",
     name: "Kiro default",
     isCustom: false,
-    capabilities: EMPTY_CAPABILITIES,
+    capabilities: KIRO_MODEL_CAPABILITIES,
   },
 ];
 
@@ -56,7 +87,7 @@ function kiroModelsFromSettings(
   customModels: ReadonlyArray<string> | undefined,
   builtInModels: ReadonlyArray<ServerProviderModel> = KIRO_BUILT_IN_MODELS,
 ): ReadonlyArray<ServerProviderModel> {
-  return providerModelsFromSettings(builtInModels, customModels ?? [], EMPTY_CAPABILITIES);
+  return providerModelsFromSettings(builtInModels, customModels ?? [], KIRO_MODEL_CAPABILITIES);
 }
 
 export function buildInitialKiroProviderSnapshot(
@@ -110,7 +141,7 @@ function buildKiroDiscoveredModels(
         slug,
         name: model.name.trim() || slug,
         isCustom: false,
-        capabilities: EMPTY_CAPABILITIES,
+        capabilities: KIRO_MODEL_CAPABILITIES,
       },
     ];
   });

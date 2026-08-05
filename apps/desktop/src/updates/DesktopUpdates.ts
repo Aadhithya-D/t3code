@@ -23,10 +23,18 @@ import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
+import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as IpcChannels from "../ipc/channels.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
+import {
+  detectMacCodeSignatureKind,
+  macUpdaterZipReady,
+  resolveMacAppBundlePath,
+  resolveMacUpdaterZipPath,
+  spawnMacAdhocReplaceAndRelaunch,
+} from "./macAdhocInstall.ts";
 import { normalizeDesktopUpdateReleaseNotes } from "./releaseNotes.ts";
 import { resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
 import {
@@ -248,6 +256,7 @@ export const make = Effect.gen(function* () {
   const config = yield* DesktopConfig.DesktopConfig;
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const desktopState = yield* DesktopState.DesktopState;
+  const electronApp = yield* ElectronApp.ElectronApp;
   const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
   const electronWindow = yield* ElectronWindow.ElectronWindow;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
@@ -451,6 +460,56 @@ export const make = Effect.gen(function* () {
     { discard: true },
   );
 
+  const tryInstallAdhocMacUpdate = Effect.fn("desktop.updates.tryInstallAdhocMacUpdate")(
+    function* () {
+      if (environment.platform !== "darwin" || !environment.isPackaged) {
+        return false;
+      }
+
+      const appBundlePath = resolveMacAppBundlePath(process.execPath);
+      if (!appBundlePath) {
+        return false;
+      }
+
+      const signatureKind = detectMacCodeSignatureKind(appBundlePath);
+      if (signatureKind !== "adhoc") {
+        yield* logUpdaterInfo("using Squirrel.Mac install path", { signatureKind });
+        return false;
+      }
+
+      const appUpdateYml = yield* Ref.get(appUpdateYmlConfigRef);
+      const cacheDirName =
+        Option.getOrUndefined(appUpdateYml)?.updaterCacheDirName?.trim() || "t3code-updater";
+      const updateZipPath = resolveMacUpdaterZipPath(cacheDirName);
+      if (!macUpdaterZipReady(updateZipPath)) {
+        yield* logUpdaterError("adhoc mac update zip is missing; cannot self-replace", {
+          updateZipPath,
+          cacheDirName,
+        });
+        return false;
+      }
+
+      const started = spawnMacAdhocReplaceAndRelaunch({
+        appBundlePath,
+        updateZipPath,
+        pid: process.pid,
+      });
+      if (!started) {
+        yield* logUpdaterError("failed to spawn adhoc mac update helper");
+        return false;
+      }
+
+      yield* logUpdaterInfo("installing adhoc mac update via post-exit self-replace", {
+        appBundlePath,
+        updateZipPath,
+      });
+      // Exit hard so the helper can replace the bundle; do not go through
+      // Squirrel.Mac (it will not relaunch unsigned / ad-hoc apps).
+      yield* electronApp.exit(0);
+      return true;
+    },
+  );
+
   const installDownloadedUpdate = Effect.gen(function* () {
     const state = yield* Ref.get(updateStateRef);
     if (
@@ -478,7 +537,16 @@ export const make = Effect.gen(function* () {
         (instance) => instance.stop({ timeout: Duration.seconds(5) }),
         { concurrency: "unbounded" },
       );
-      yield* electronWindow.destroyAll;
+
+      // Personal / unsigned mac builds cannot use Squirrel.Mac relaunch.
+      // Replace the bundle after exit instead of quitAndInstall.
+      if (yield* tryInstallAdhocMacUpdate()) {
+        return { accepted: true, completed: false };
+      }
+
+      // Do not destroy windows here. electron-updater / Squirrel.Mac own
+      // the quit+relaunch window lifecycle; destroying first leaves a
+      // windowless process and has been observed to quit without relaunch.
       yield* electronUpdater.quitAndInstall({
         isSilent: true,
         isForceRunAfter: true,
@@ -732,7 +800,12 @@ export const make = Effect.gen(function* () {
       yield* Ref.set(updaterConfiguredRef, true);
 
       yield* electronUpdater.setAutoDownload(false);
-      yield* electronUpdater.setAutoInstallOnAppQuit(false);
+      // macOS (electron-updater MacUpdater): autoInstallOnAppQuit only controls
+      // whether Squirrel.Mac is fed the downloaded zip after our download
+      // finishes. MacUpdater does not auto-install on quit the way Windows
+      // does, so leaving this true makes Restart install reliable. On Windows
+      // keep false so updates only install when the user clicks Restart.
+      yield* electronUpdater.setAutoInstallOnAppQuit(environment.platform === "darwin");
       yield* applyAutoUpdaterChannel(settings.updateChannel);
       yield* electronUpdater.setDisableDifferentialDownload(
         isArm64HostRunningIntelBuild(environment.runtimeInfo),

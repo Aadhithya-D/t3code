@@ -48,7 +48,9 @@ export function UsagePage() {
     [merged.providers, metric],
   );
 
-  const activeDays = merged.daily.filter((day) => day.totalTokens > 0).length;
+  // Kiro often reports credit cost without token counters, so cost-only days
+  // still count as active for the per-day average denominator.
+  const activeDays = merged.daily.filter((day) => day.totalTokens > 0 || day.costUsd > 0).length;
   const dailyAverage = activeDays === 0 ? 0 : merged.totalTokens / activeDays;
   const observedInput = merged.uncachedInputTokens + merged.cachedInputTokens;
   const cachedShare = observedInput === 0 ? 0 : merged.cachedInputTokens / observedInput;
@@ -305,7 +307,10 @@ export function UsagePage() {
                     <tbody>
                       {recentDays.length === 0 ? (
                         <tr>
-                          <td colSpan={5} className="py-6 text-center text-muted-foreground">
+                          <td
+                            colSpan={PROVIDER_ORDER.length + 3}
+                            className="py-6 text-center text-muted-foreground"
+                          >
                             No activity in this window.
                           </td>
                         </tr>

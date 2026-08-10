@@ -38,6 +38,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import { resolveClaudeHomePath } from "../provider/Drivers/ClaudeHome.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
+import { readKiroUsage, resolveKiroSessionsDir } from "./usageKiroReader.ts";
 import { parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
   listTranscriptFiles,
@@ -378,6 +379,71 @@ export const make = Effect.gen(function* () {
         distinctSessions: sessionIds.size,
         message: null,
       });
+    }
+
+    const kiroSessionsDir = resolveKiroSessionsDir(NodeOS.homedir());
+    const kiroVolumeId = yield* Effect.promise(() => readDirectoryVolumeId(kiroSessionsDir));
+    const kiroExists = yield* fileSystem
+      .exists(kiroSessionsDir)
+      .pipe(Effect.catchCause(() => Effect.succeed(false)));
+
+    if (!kiroExists) {
+      sources.push({
+        fingerprint: {
+          hostId,
+          provider: "kiro",
+          resolvedHomePath: kiroSessionsDir,
+          volumeId: kiroVolumeId,
+        },
+        status: "missing",
+        scannedFiles: 0,
+        skippedFiles: 0,
+        malformedRecords: 0,
+        distinctSessions: 0,
+        message: "No Kiro CLI session directory on this environment.",
+      });
+    } else {
+      const result = yield* Effect.promise(() => readKiroUsage(kiroSessionsDir, windowStartMs));
+      if (result === null) {
+        sources.push({
+          fingerprint: {
+            hostId,
+            provider: "kiro",
+            resolvedHomePath: kiroSessionsDir,
+            volumeId: kiroVolumeId,
+          },
+          status: "failed",
+          scannedFiles: 0,
+          skippedFiles: 0,
+          malformedRecords: 0,
+          distinctSessions: 0,
+          message: "Kiro CLI session sidecars could not be read.",
+        });
+      } else {
+        const sessionIds = new Set<string>();
+        for (const record of result.records) {
+          if (aggregator.add(record) && record.sessionId.length > 0) {
+            sessionIds.add(record.sessionId);
+          }
+        }
+        sources.push({
+          fingerprint: {
+            hostId,
+            provider: "kiro",
+            resolvedHomePath: kiroSessionsDir,
+            volumeId: kiroVolumeId,
+          },
+          status: result.malformedRecords > 0 ? "partial" : "ok",
+          scannedFiles: result.scannedFiles,
+          skippedFiles: result.skippedFiles,
+          malformedRecords: result.malformedRecords,
+          distinctSessions: sessionIds.size,
+          message:
+            result.malformedRecords > 0
+              ? "Some Kiro CLI session sidecars could not be read."
+              : null,
+        });
+      }
     }
 
     const pruned = pruneScanCache(fileCache, {

@@ -83,6 +83,74 @@ it("maps current Codex model capability fields", () => {
   ]);
 });
 
+it("uses standard routing when the catalog default service tier is Fast", () => {
+  const capabilities = mapCodexModelCapabilities({
+    additionalSpeedTiers: ["fast"],
+    defaultReasoningEffort: "medium",
+    defaultServiceTier: "fast",
+    description: "Test model",
+    displayName: "GPT Test",
+    hidden: false,
+    id: "gpt-test",
+    isDefault: true,
+    model: "gpt-test",
+    serviceTiers: [],
+    supportedReasoningEfforts: [],
+  });
+
+  assert.deepStrictEqual(capabilities.optionDescriptors, [
+    {
+      id: "serviceTier",
+      label: "Service Tier",
+      type: "select",
+      options: [
+        { id: "default", label: "Standard", isDefault: true },
+        { id: "fast", label: "Fast" },
+      ],
+      currentValue: "default",
+    },
+  ]);
+});
+
+it("uses standard routing when the catalog default Fast tier is named priority", () => {
+  const capabilities = mapCodexModelCapabilities({
+    additionalSpeedTiers: [],
+    defaultReasoningEffort: "medium",
+    defaultServiceTier: "priority",
+    description: "Test model",
+    displayName: "GPT Test",
+    hidden: false,
+    id: "gpt-test",
+    isDefault: true,
+    model: "gpt-test",
+    serviceTiers: [
+      {
+        id: "priority",
+        name: "Fast",
+        description: "1.5x speed, increased usage",
+      },
+    ],
+    supportedReasoningEfforts: [],
+  });
+
+  assert.deepStrictEqual(capabilities.optionDescriptors, [
+    {
+      id: "serviceTier",
+      label: "Service Tier",
+      type: "select",
+      options: [
+        { id: "default", label: "Standard", isDefault: true },
+        {
+          id: "priority",
+          label: "Fast",
+          description: "1.5x speed, increased usage",
+        },
+      ],
+      currentValue: "default",
+    },
+  ]);
+});
+
 it("uses standard routing when the catalog has no default service tier", () => {
   const capabilities = mapCodexModelCapabilities({
     additionalSpeedTiers: ["fast"],

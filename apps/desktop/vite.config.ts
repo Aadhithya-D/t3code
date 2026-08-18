@@ -12,6 +12,7 @@ const publicConfigDefine = {
   __T3CODE_CLI_PACKAGE_NAME__: JSON.stringify(
     normalizeCliPackageName(process.env.T3CODE_CLI_PACKAGE_NAME),
   ),
+  __T3CODE_DESKTOP_PASSKEYS__: JSON.stringify(process.env.T3CODE_DESKTOP_PASSKEYS !== "0"),
 };
 
 export default defineConfig({

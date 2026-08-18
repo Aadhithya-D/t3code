@@ -265,6 +265,8 @@ jobs:
     env:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
       T3CODE_CLI_PACKAGE_NAME: "@adithyasak/t3"
+      # Unsigned personal builds have no Apple application-identifier entitlement.
+      T3CODE_DESKTOP_PASSKEYS: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6

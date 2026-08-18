@@ -7,9 +7,10 @@ import type {
 import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer } from "electron";
 
+import { desktopPasskeysEnabled } from "./app/desktopPasskeys.ts";
 import * as IpcChannels from "./ipc/channels.ts";
 
-exposeClerkBridge({ passkeys: true });
+exposeClerkBridge({ passkeys: desktopPasskeysEnabled });
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (

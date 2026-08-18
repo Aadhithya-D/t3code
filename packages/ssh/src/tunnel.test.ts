@@ -93,7 +93,7 @@ describe("ssh tunnel scripts", () => {
     const script = buildRemoteT3RunnerScript({ nodeEngineRange: TEST_NODE_ENGINE_RANGE });
 
     assert.include(script, "T3_NODE_SCRIPT_PATH=''");
-    assert.include(script, 'exec t3 "$@"');
+    assert.notInclude(script, 'exec t3 "$@"');
     assert.include(script, "exec npx --yes 't3@latest' \"$@\"");
     assert.include(script, "exec npm exec --yes 't3@latest' -- \"$@\"");
     assert.include(script, "could not install 't3@latest'");
@@ -130,6 +130,17 @@ describe("ssh tunnel scripts", () => {
     assert.include(script, "exec npx --yes 't3@nightly; touch /tmp/t3-owned' \"$@\"");
     assert.include(script, "exec npm exec --yes 't3@nightly; touch /tmp/t3-owned' -- \"$@\"");
     assert.notInclude(script, "exec npx --yes t3@nightly; touch /tmp/t3-owned");
+    assert.notInclude(script, "command -v t3");
+  });
+
+  it("never prefers a global t3 binary over the pinned package spec", () => {
+    const script = buildRemoteT3RunnerScript({
+      packageSpec: "@adithyasak/t3@0.0.34-adi.1",
+    });
+
+    assert.include(script, "exec npx --yes '@adithyasak/t3@0.0.34-adi.1' \"$@\"");
+    assert.notInclude(script, "command -v t3");
+    assert.notInclude(script, "exec t3 ");
   });
 
   it("builds the remote t3 runner with a node script override", () => {

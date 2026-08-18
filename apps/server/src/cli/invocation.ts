@@ -1,8 +1,17 @@
 import * as Effect from "effect/Effect";
 
+import { formatCliPackageSpec, normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 import { HostProcessArguments } from "@t3tools/shared/hostProcess";
 
 import packageJson from "../../package.json" with { type: "json" };
+
+declare const __T3CODE_CLI_PACKAGE_NAME__: string | undefined;
+
+function resolveCliPackageName(): string {
+  return normalizeCliPackageName(
+    typeof __T3CODE_CLI_PACKAGE_NAME__ === "undefined" ? undefined : __T3CODE_CLI_PACKAGE_NAME__,
+  );
+}
 
 export type CliRunner = "npx" | "pnpm dlx" | "bunx";
 
@@ -43,7 +52,8 @@ export function detectCliRunner(entryPath: string): CliRunner | null {
  * anything else suggests the bare package.
  */
 export function suggestedPackageSpec(version: string): string {
-  return version.includes("-nightly.") ? "t3@nightly" : "t3";
+  const packageName = resolveCliPackageName();
+  return version.includes("-nightly.") ? formatCliPackageSpec(packageName, "nightly") : packageName;
 }
 
 /**

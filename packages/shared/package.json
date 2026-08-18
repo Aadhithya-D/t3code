@@ -147,6 +147,10 @@
       "types": "./src/cliArgs.ts",
       "import": "./src/cliArgs.ts"
     },
+    "./cliPackage": {
+      "types": "./src/cliPackage.ts",
+      "import": "./src/cliPackage.ts"
+    },
     "./connectAuth": {
       "types": "./src/connectAuth.ts",
       "import": "./src/connectAuth.ts"

@@ -15,10 +15,13 @@ import * as Option from "effect/Option";
 import * as Electron from "electron";
 
 import * as NetService from "@t3tools/shared/Net";
+import { normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveRemoteT3CliPackageSpec } from "@t3tools/ssh/command";
 import type { RemoteT3RunnerOptions } from "@t3tools/ssh/tunnel";
 import serverPackageJson from "../../server/package.json" with { type: "json" };
+
+declare const __T3CODE_CLI_PACKAGE_NAME__: string | undefined;
 
 import * as DesktopIpc from "./ipc/DesktopIpc.ts";
 import * as ElectronApp from "./electron/ElectronApp.ts";
@@ -96,6 +99,11 @@ const resolveDesktopSshCliRunner = (
       appVersion: environment.appVersion,
       updateChannel: settings.updateChannel,
       isDevelopment: environment.isDevelopment,
+      packageName: normalizeCliPackageName(
+        typeof __T3CODE_CLI_PACKAGE_NAME__ === "undefined"
+          ? undefined
+          : __T3CODE_CLI_PACKAGE_NAME__,
+      ),
     }),
     nodeEngineRange: serverPackageJson.engines.node,
   };

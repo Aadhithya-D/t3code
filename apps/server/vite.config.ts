@@ -2,6 +2,7 @@ import "vite-plus/test/config";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
+import { normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 import packageJson from "./package.json" with { type: "json" };
 
@@ -60,6 +61,9 @@ export default mergeConfig(
         ),
         __T3CODE_BUILD_RELAY_CLIENT_OTLP_TRACES_TOKEN__: JSON.stringify(
           repoEnv.T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN?.trim() ?? "",
+        ),
+        __T3CODE_CLI_PACKAGE_NAME__: JSON.stringify(
+          normalizeCliPackageName(process.env.T3CODE_CLI_PACKAGE_NAME),
         ),
       },
     },

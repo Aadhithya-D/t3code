@@ -4,7 +4,8 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { Launcher, readServiceState, writeServiceState } from "./serviceLauncher.ts";
+import { pinnedRuntimePaths } from "./cloud/pinnedRuntime.ts";
+import { Launcher, readServiceState, runtimePaths, writeServiceState } from "./serviceLauncher.ts";
 import {
   compareExactServiceVersions,
   decodeServiceState,
@@ -20,6 +21,30 @@ it("accepts only exact semantic versions", () => {
   for (const version of ["latest", "01.2.3", "1.2.3-01", "1.2.3-alpha..1", "1.2.3+."]) {
     assert.isFalse(isExactServiceVersion(version), version);
   }
+});
+
+it("looks up the pinned runtime under the same scoped package path the installer uses", () => {
+  assert.equal(
+    runtimePaths("/home/ubuntu/.t3", "0.0.33-adi.5").entryPath,
+    "/home/ubuntu/.t3/runtime/versions/0.0.33-adi.5/node_modules/t3/dist/bin.mjs",
+  );
+  assert.equal(
+    runtimePaths("/home/ubuntu/.t3", "0.0.33-adi.5", "@adithyasak/t3").entryPath,
+    "/home/ubuntu/.t3/runtime/versions/0.0.33-adi.5/node_modules/@adithyasak/t3/dist/bin.mjs",
+  );
+});
+
+it.layer(NodeServices.layer)("service launcher runtime layout", (it) => {
+  it.effect("matches pinnedRuntimePaths for a scoped CLI package", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const pinned = pinnedRuntimePaths(path, "/home/ubuntu/.t3", "0.0.33-adi.5", "@adithyasak/t3");
+      assert.equal(
+        runtimePaths("/home/ubuntu/.t3", "0.0.33-adi.5", "@adithyasak/t3").entryPath,
+        pinned.entryPath,
+      );
+    }),
+  );
 });
 
 it("orders exact semantic versions without treating build metadata as precedence", () => {

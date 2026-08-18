@@ -32,11 +32,12 @@ npx t3@latest service uninstall
 Updating restarts T3 Code briefly. Let active agent work and terminal commands finish first.
 If a remote update is already in progress, wait for it to finish before retrying a local update.
 
-The systemd unit runs a small stable launcher. Exact T3 Code versions are installed separately, so
-a failed remote candidate can return to the previous version without rewriting the unit. The
-launcher snapshots the database before a remote candidate starts, so database updates roll back
-with the server version. An older launcher may require one local `service update` before this is
-available.
+The systemd unit runs a small stable launcher. It pins `T3CODE_HOME` to this machine's T3 home and
+starts that launcher with the Node binary used to install the service, so you do not set those
+paths by hand on each host. Exact T3 Code versions are installed separately, so a failed remote
+candidate can return to the previous version without rewriting the unit. The launcher snapshots
+the database before a remote candidate starts, so database updates roll back with the server
+version. An older launcher may require one local `service update` before this is available.
 
 ## Using It with T3 Connect
 

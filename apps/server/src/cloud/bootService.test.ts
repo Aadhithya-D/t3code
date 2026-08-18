@@ -35,6 +35,22 @@ it("keeps systemd pinned to the stable launcher rather than a versioned server",
   expect(unit).not.toContain("versions/1.2.3");
 });
 
+it("injects T3CODE_HOME from the installed launcher path, not a mismatched plan home", () => {
+  const unit = BootService.renderBootServiceUnit({
+    nodePath: "/home/ubuntu/.nvm/versions/node/v24.19.0/bin/node",
+    launcherPath: "/home/ubuntu/.t3/runtime/service-launcher.mjs",
+    baseDir: "/tmp/wrong-t3-home",
+    logPath: "/home/ubuntu/.t3/userdata/logs/boot-service.log",
+    unitPath: "/home/ubuntu/.config/systemd/user/t3code.service",
+  });
+
+  expect(unit).toContain("Environment=T3CODE_HOME=/home/ubuntu/.t3");
+  expect(unit).toContain(
+    "ExecStart=/home/ubuntu/.nvm/versions/node/v24.19.0/bin/node /home/ubuntu/.t3/runtime/service-launcher.mjs",
+  );
+  expect(unit).not.toContain("/tmp/wrong-t3-home");
+});
+
 it("survives the kernel OOM-killing a greedy agent child", () => {
   const unit = BootService.renderBootServiceUnit({
     nodePath: "/usr/bin/node",
@@ -117,6 +133,10 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
         activeVersion: "1.2.3",
       });
       expect(yield* fs.readFileString(plan.launcherPath)).toBe("export {};\n");
+      const unit = yield* fs.readFileString(plan.unitPath);
+      expect(plan.launcherPath.endsWith("/.t3/runtime/service-launcher.mjs")).toBe(true);
+      expect(unit).toContain(`Environment=T3CODE_HOME=${plan.baseDir}`);
+      expect(unit).toContain(`ExecStart=/usr/bin/node ${plan.launcherPath}`);
       expect((yield* service.status).current).toBe(true);
       // @effect-diagnostics-next-line preferSchemaOverJson:off - fixed launcher-owned test document.
       const pendingState = JSON.stringify({

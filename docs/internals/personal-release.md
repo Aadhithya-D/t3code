@@ -68,4 +68,12 @@ and add a Trusted Publisher:
   the Clerk sheet. Google OAuth is kept in an in-app window so the `t3code://` callback is not
   stolen by official T3 Code. Official passkeys stay tied to `com.t3tools.t3code`.
 - Personal npm builds do not bundle resource-monitor binaries.
+- `node-pty` ships no Linux prebuilds. On Linux the CLI compiles it at install time. If you see
+  `Failed to load node-pty for linux-x64`, install `python3`, `make`, and `g++`, prefer Node 24 LTS
+  over Node 26, then `npm rebuild node-pty` inside the installed package. Official `t3` has the same
+  requirement.
+- The background-service launcher must resolve
+  `runtime/versions/<version>/node_modules/@adithyasak/t3/dist/bin.mjs`, not unscoped `node_modules/t3`.
+  After this ships, run `npx @adithyasak/t3@<version> service update` so `~/.t3/runtime/service-launcher.mjs`
+  is replaced. A unit that still points at the old launcher will fail with "runtime is missing or incomplete."
 - Kiro and the rest of the personal-fork provider work are unchanged by this distribution path.

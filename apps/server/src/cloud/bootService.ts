@@ -41,6 +41,19 @@ export function quoteSystemdValue(value: string): string {
     : escaped;
 }
 
+/**
+ * The launcher is always `<T3CODE_HOME>/runtime/service-launcher.mjs`.
+ * The unit must inject that same home; systemd has no shell profile or nvm.
+ */
+export function t3HomeFromServiceLauncherPath(launcherPath: string): string | undefined {
+  const normalized = launcherPath.replaceAll("\\", "/");
+  const suffix = `/runtime/${SERVICE_LAUNCHER_FILE}`;
+  if (!normalized.endsWith(suffix) || normalized.length <= suffix.length) {
+    return undefined;
+  }
+  return launcherPath.slice(0, launcherPath.length - suffix.length);
+}
+
 export interface BootServicePlan {
   readonly nodePath: string;
   readonly launcherPath: string;
@@ -51,6 +64,7 @@ export interface BootServicePlan {
 
 /** Pure renderer: service units cannot rely on the user's shell or PATH. */
 export function renderBootServiceUnit(plan: BootServicePlan): string {
+  const t3Home = t3HomeFromServiceLauncherPath(plan.launcherPath) ?? plan.baseDir;
   // The user manager has no reliable network-online target; server networking retries itself.
   return [
     "[Unit]",
@@ -61,7 +75,7 @@ export function renderBootServiceUnit(plan: BootServicePlan): string {
     "[Service]",
     "Type=simple",
     "WorkingDirectory=%h",
-    `Environment=T3CODE_HOME=${quoteSystemdValue(plan.baseDir)}`,
+    `Environment=T3CODE_HOME=${quoteSystemdValue(t3Home)}`,
     `Environment=${BOOT_SERVICE_UNIT_ENV}=${BOOT_SERVICE_UNIT_FILE}`,
     `ExecStart=${quoteSystemdValue(plan.nodePath)} ${quoteSystemdValue(plan.launcherPath)}`,
     // Let the launcher mark an explicit stop before it signals the server.

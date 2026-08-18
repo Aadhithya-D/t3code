@@ -12,6 +12,7 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
+import { installDesktopInAppOAuth } from "./desktopInAppOAuth.ts";
 import { desktopPasskeysEnabled } from "./desktopPasskeys.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 
@@ -74,13 +75,17 @@ export const desktopClerkFrontendApiHostname = resolveDesktopClerkFrontendApiHos
 );
 
 export function createDesktopClerkBridge(stateDir: string, isDevelopment: boolean) {
+  const renderer = {
+    scheme: ElectronProtocol.getDesktopScheme(isDevelopment),
+    host: ElectronProtocol.DESKTOP_HOST,
+  };
+  if (!desktopPasskeysEnabled) {
+    installDesktopInAppOAuth(renderer);
+  }
   return createClerkBridge({
     storage: storage({ path: stateDir }),
     passkeys: desktopPasskeysEnabled,
-    renderer: {
-      scheme: ElectronProtocol.getDesktopScheme(isDevelopment),
-      host: ElectronProtocol.DESKTOP_HOST,
-    },
+    renderer,
   });
 }
 

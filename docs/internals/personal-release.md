@@ -64,7 +64,8 @@ and add a Trusted Publisher:
   `npx --yes <pinned spec>`.
 - Official T3 Code and T3 Code Adi both register `t3code://`. macOS hands OAuth callbacks to one
   default handler. If Connect sign-in opens the official app, quit it or “Open With” T3 Code Adi.
-- Personal Mac builds are unsigned, so native Clerk passkeys are disabled. Connect sign-in uses
-  email/OAuth instead. Official passkeys stay tied to `com.t3tools.t3code`.
+- Personal Mac builds are unsigned, so native Clerk passkeys are disabled. Email sign-in stays in
+  the Clerk sheet. Google OAuth is kept in an in-app window so the `t3code://` callback is not
+  stolen by official T3 Code. Official passkeys stay tied to `com.t3tools.t3code`.
 - Personal npm builds do not bundle resource-monitor binaries.
 - Kiro and the rest of the personal-fork provider work are unchanged by this distribution path.

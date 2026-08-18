@@ -369,9 +369,9 @@ const packCmd = Command.make(
           Effect.gen(function* () {
             yield* applyPreparedPublishPackage(resource);
 
-            const args = ["pack", "--pack-destination", outputDir];
-            const spawnCommand = yield* resolveSpawnCommand("pnpm", args);
-            yield* Effect.log(`[cli] Running: pnpm ${args.join(" ")}`);
+            const args = ["pm", "pack", "--pack-destination", outputDir];
+            const spawnCommand = yield* resolveSpawnCommand("vp", args);
+            yield* Effect.log(`[cli] Running: vp ${args.join(" ")}`);
             yield* runCommand(
               ChildProcess.make(spawnCommand.command, spawnCommand.args, {
                 cwd: serverDir,

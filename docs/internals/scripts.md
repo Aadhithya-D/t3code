@@ -64,7 +64,7 @@ authenticated.
 - `node apps/server/scripts/t3-sqlite-state.ts <query|exec> --base-dir <path> ...`: Inspects or seeds
   an isolated T3 SQLite database; writes create a private backup first.
 - `node apps/server/scripts/cli.ts pack --app-version <version> --package-name <name> [--publish]`:
-  Prepares `apps/server` with resolved catalog dependencies and runs `pnpm pack`. `--publish` runs
+  Prepares `apps/server` with resolved catalog dependencies and runs `vp pm pack`. `--publish` runs
   `npm publish` on the tarball (first-time package creation). The personal release workflow uses the
   same pack step. See [personal-release.md](./personal-release.md).
 

@@ -64,6 +64,10 @@ const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
 const DEFAULT_SERVICE_TIER_ID = "default";
 const CURRENT_CODEX_MODELS = new Set(["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]);
 
+function isFastServiceTier(tier: { readonly id: string; readonly name: string }): boolean {
+  return tier.id === "fast" || tier.name === "Fast";
+}
+
 export function isLegacyCodexModel(model: string): boolean {
   return !CURRENT_CODEX_MODELS.has(model);
 }
@@ -136,12 +140,13 @@ export function mapCodexModelCapabilities(
           name: id === "fast" ? "Fast" : id,
           description: "",
         }));
-  const catalogDefaultServiceTier = serviceTiers.some(
+  const catalogDefaultServiceTier = serviceTiers.find(
     (tier) => tier.id === model.defaultServiceTier,
-  )
-    ? model.defaultServiceTier
-    : null;
-  const defaultServiceTier = catalogDefaultServiceTier ?? DEFAULT_SERVICE_TIER_ID;
+  );
+  const defaultServiceTier =
+    catalogDefaultServiceTier && !isFastServiceTier(catalogDefaultServiceTier)
+      ? catalogDefaultServiceTier.id
+      : DEFAULT_SERVICE_TIER_ID;
   const optionDescriptors: ProviderOptionDescriptor[] = [];
 
   if (reasoningOptions.length > 0) {

@@ -36,6 +36,14 @@ const successfulRunner = (fs: FileSystem.FileSystem, path: Path.Path) =>
   });
 
 it.layer(NodeServices.layer)("ensurePinnedRuntimeInstalled", (it) => {
+  it.effect("resolves scoped npm package entry paths", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const paths = pinnedRuntimePaths(path, "/tmp/t3", "0.0.34-adi.1", "@adithyasak/t3");
+      assert.ok(paths.entryPath.endsWith("/node_modules/@adithyasak/t3/dist/bin.mjs"));
+    }),
+  );
+
   it.effect("validates a staging tree before atomically publishing it", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

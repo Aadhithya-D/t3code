@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import type { Dirent } from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+
 import {
   type DirItem,
   type DirSearchResult,
@@ -23,6 +28,7 @@ import type {
   ProjectSearchContentsResult,
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
+import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 
 const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
@@ -111,6 +117,7 @@ export class WorkspaceSearchIndex extends Context.Service<
       query: string,
       limit: number,
       kind?: ProjectEntryKind,
+      imageOnly?: boolean,
     ) => Effect.Effect<ProjectSearchEntriesResult, WorkspaceSearchIndexSearchFailed>;
     readonly searchContents: (
       input: Omit<ProjectSearchContentsInput, "cwd">,
@@ -157,15 +164,18 @@ function toDirectoryEntry(item: DirItem): ProjectEntry | null {
   return normalizedPath ? { path: normalizedPath, kind: "directory" } : null;
 }
 
-function mapFileSearchResult(result: SearchResult, limit: number): ProjectSearchEntriesResult {
+function mapFileSearchResult(
+  result: SearchResult,
+  limit: number,
+  imageOnly = false,
+): ProjectSearchEntriesResult {
+  const entries = result.items.flatMap((item) => {
+    const entry = toFileEntry(item);
+    return entry && (!imageOnly || isWorkspaceImagePreviewPath(entry.path)) ? [entry] : [];
+  });
   return {
-    entries: result.items
-      .flatMap((item) => {
-        const entry = toFileEntry(item);
-        return entry ? [entry] : [];
-      })
-      .slice(0, limit),
-    truncated: result.totalMatched > limit,
+    entries: entries.slice(0, limit),
+    truncated: entries.length > limit || result.totalMatched > result.items.length,
   };
 }
 
@@ -290,6 +300,80 @@ function withDirectoryAncestors(entries: ReadonlyArray<ProjectEntry>): ProjectEn
     }
   }
   return [...entryByPath.values()];
+}
+
+const DOTENV_WALK_SKIP_DIR_NAMES = new Set([
+  "node_modules",
+  ".git",
+  ".t3",
+  ".pnpm-store",
+  ".yarn",
+  ".turbo",
+  ".next",
+  ".cache",
+  ".venv",
+  "dist",
+  "build",
+  "coverage",
+  "target",
+  "venv",
+  "__pycache__",
+]);
+
+function isDotEnvFileName(name: string): boolean {
+  return name === ".env" || name.startsWith(".env.");
+}
+
+function mergeProjectEntries(
+  entries: ReadonlyArray<ProjectEntry>,
+  extra: ReadonlyArray<ProjectEntry>,
+): ProjectEntry[] {
+  if (extra.length === 0) {
+    return [...entries];
+  }
+  const entryByPath = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const entry of extra) {
+    if (!entryByPath.has(entry.path)) {
+      entryByPath.set(entry.path, entry);
+    }
+  }
+  return [...entryByPath.values()];
+}
+
+async function collectDotEnvFiles(cwd: string): Promise<ProjectEntry[]> {
+  const entries: ProjectEntry[] = [];
+
+  const walk = async (absoluteDir: string, relativeDir: string): Promise<void> => {
+    let dirents: Dirent[];
+    try {
+      dirents = await NodeFSP.readdir(absoluteDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const dirent of dirents) {
+      if (dirent.isDirectory()) {
+        if (DOTENV_WALK_SKIP_DIR_NAMES.has(dirent.name)) {
+          continue;
+        }
+        const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
+        await walk(NodePath.join(absoluteDir, dirent.name), childRelative);
+        continue;
+      }
+      if (!isDotEnvFileName(dirent.name)) {
+        continue;
+      }
+      const relativePath = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
+      entries.push({ path: toPosixPath(relativePath), kind: "file" });
+    }
+  };
+
+  try {
+    await walk(cwd, "");
+    return entries;
+  } catch {
+    return [];
+  }
 }
 
 const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
@@ -432,9 +516,13 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
         finder.mixedSearch("", { pageSize: WORKSPACE_INDEX_PAGE_SIZE }),
       );
       const mapped = mapMixedSearchResult(result, WORKSPACE_INDEX_MAX_ENTRIES);
-      const sortedEntries = withDirectoryAncestors(mapped.entries).toSorted((left, right) =>
-        left.path.localeCompare(right.path),
-      );
+      // FileFinder honors gitignore, so `.env` / `.env.local` never appear in
+      // the sidebar tree. Overlay those paths for the editor-only list; path
+      // search (`@` mentions, command palette) stays on the gitignored index.
+      const dotenvEntries = yield* Effect.promise(() => collectDotEnvFiles(cwd));
+      const sortedEntries = withDirectoryAncestors(
+        mergeProjectEntries(mapped.entries, dotenvEntries),
+      ).toSorted((left, right) => left.path.localeCompare(right.path));
       const entries = sortedEntries.slice(0, WORKSPACE_INDEX_MAX_ENTRIES);
       return {
         entries,
@@ -445,13 +533,13 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
 
   const search: WorkspaceSearchIndex["Service"]["search"] = Effect.fn(
     "WorkspaceSearchIndex.search",
-  )(function* (query, limit, kind) {
-    const pageSize = Math.max(1, limit + 1);
-    if (kind === "file") {
+  )(function* (query, limit, kind, imageOnly) {
+    const pageSize = imageOnly ? WORKSPACE_INDEX_PAGE_SIZE : Math.max(1, limit + 1);
+    if (kind === "file" || imageOnly) {
       const result = yield* runSearch(query, pageSize, "fileSearch", () =>
         finder.fileSearch(query, { pageSize }),
       );
-      return mapFileSearchResult(result, limit);
+      return mapFileSearchResult(result, limit, imageOnly);
     }
     if (kind === "directory") {
       const result = yield* runSearch(query, pageSize, "directorySearch", () =>

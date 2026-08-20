@@ -1,5 +1,6 @@
 import { defineConfig } from "vite-plus";
 
+import { normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
 const repoEnv = loadRepoEnv();
@@ -8,6 +9,10 @@ const publicConfigDefine = {
   __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
   ),
+  __T3CODE_CLI_PACKAGE_NAME__: JSON.stringify(
+    normalizeCliPackageName(process.env.T3CODE_CLI_PACKAGE_NAME),
+  ),
+  __T3CODE_DESKTOP_PASSKEYS__: JSON.stringify(process.env.T3CODE_DESKTOP_PASSKEYS !== "0"),
 };
 
 export default defineConfig({

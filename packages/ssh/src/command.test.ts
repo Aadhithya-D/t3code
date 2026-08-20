@@ -131,6 +131,14 @@ describe("ssh command", () => {
         }),
         "t3@nightly",
       );
+      assert.equal(
+        resolveRemoteT3CliPackageSpec({
+          appVersion: "0.0.34-adi.1",
+          updateChannel: "latest",
+          packageName: "@adithyasak/t3",
+        }),
+        "@adithyasak/t3@0.0.34-adi.1",
+      );
     }),
   );
 

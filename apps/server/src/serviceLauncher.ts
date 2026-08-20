@@ -2,12 +2,15 @@
 // @effect-diagnostics globalDate:off
 // @effect-diagnostics globalTimers:off
 // This file is shipped as a standalone bundle and copied to a stable path by
-// `t3 service update`. Keep runtime imports limited to Node built-ins.
+// `t3 service update`. Runtime imports must bundle to Node built-ins plus the
+// inlined CLI package-name helper.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+
+import { cliPackageNodeModulesSegments, normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 
 import type {
   PendingServiceUpdate,
@@ -28,6 +31,8 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 
+declare const __T3CODE_CLI_PACKAGE_NAME__: string | undefined;
+
 const HANDOFF_DELAY_MS = 2_000;
 const PREPARED_TIMEOUT_MS = 120_000;
 const TERMINATE_GRACE_MS = 5_000;
@@ -41,11 +46,26 @@ interface ManagedChild {
   readonly process: NodeChildProcess.ChildProcess;
 }
 
-const runtimePaths = (baseDir: string, version: string) => {
+function resolveCliPackageName(
+  packageName = typeof __T3CODE_CLI_PACKAGE_NAME__ === "undefined"
+    ? undefined
+    : __T3CODE_CLI_PACKAGE_NAME__,
+): string {
+  return normalizeCliPackageName(packageName);
+}
+
+/** Same install layout as `pinnedRuntimePaths`: `<cli-package>/dist/bin.mjs`. */
+export const runtimePaths = (baseDir: string, version: string, packageName?: string) => {
   const versionDir = NodePath.join(baseDir, "runtime", "versions", version);
   return {
     versionDir,
-    entryPath: NodePath.join(versionDir, "node_modules", "t3", "dist", "bin.mjs"),
+    entryPath: NodePath.join(
+      versionDir,
+      "node_modules",
+      ...cliPackageNodeModulesSegments(resolveCliPackageName(packageName)),
+      "dist",
+      "bin.mjs",
+    ),
     sentinelPath: NodePath.join(versionDir, ".install-complete"),
   };
 };

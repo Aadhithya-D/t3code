@@ -22,3 +22,5 @@ signing only when platform credentials are present. macOS passkey builds additio
 Without the core signing credentials, it still releases unsigned artifacts.
 
 See [Release Checklist](../operations/release.md) for the full release/signing setup checklist.
+Personal-fork desktop and npm publishing live in
+[personal-release.md](./personal-release.md).

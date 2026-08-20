@@ -1,9 +1,8 @@
-# Personal fork workflow: build an unsigned macOS DMG on GitHub-hosted runners
-# and publish it to a GitHub Release that the desktop app can auto-update from.
+# Personal fork release: publish @adithyasak/t3 and the unsigned macOS DMG at the
+# same version. One dispatch or one personal-v* tag updates both.
 #
 # Why this exists: upstream Release/CI jobs use private Blacksmith runners and
-# org-only relay secrets, so they never start on personal forks. This workflow
-# only needs macos-latest + contents:write.
+# org-only relay/npm config, so they never start on personal forks.
 #
 # In-app updates:
 #   Builds bake T3CODE_DESKTOP_UPDATE_REPOSITORY=$GITHUB_REPOSITORY into the app, so
@@ -11,19 +10,26 @@
 #   Releases MUST be full (non-prerelease) + latest so electron-updater's
 #   /releases/latest endpoint can find them on the "latest" channel.
 #
+# T3 Connect:
+#   Copies .env.example to .env so the production Clerk/relay public identifiers
+#   are baked into both the CLI package and the desktop bundle.
+#
+# Remote CLI:
+#   Desktop SSH launch installs @adithyasak/t3@<this version>. npm is published
+#   first so that package exists before the DMG is released.
+#
 # Usage:
-#   1. Actions → "Personal macOS Release" → Run workflow
-#   2. Or push a tag: personal-v0.0.28-adi.3
+#   1. Actions → "Personal Release" → Run workflow (same version for npm + Mac)
+#   2. Or push a tag: personal-v0.0.33-adi.3
 #   3. First install: download the DMG from the GitHub Release once
-#   4. Later versions: open T3 Code Adi → Check for Updates (or wait for the
-#      rocket update button) — no manual DMG download needed
-name: Personal macOS Release
+#   4. Later versions: open T3 Code Adi → Check for Updates
+name: Personal Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 0.0.28-adi.3). Empty = package.json version + -adi.<run_number>"
+        description: "Shared version for npm + Mac (e.g. 0.0.33-adi.2). Empty = package.json version + -adi.<run_number>"
         required: false
         type: string
       arch:
@@ -44,6 +50,11 @@ on:
         required: false
         default: com.t3tools.t3code.adi
         type: string
+      skip_npm:
+        description: "Skip npm publish (Mac-only; versions will drift)"
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "personal-v*"
@@ -52,35 +63,26 @@ on:
 # Safe for personal forks that lack Blacksmith runners.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
-  build_and_release:
-    name: Build macOS DMG + publish release
+  meta:
+    name: Resolve shared release version
     if: github.repository_owner != 'pingdotgg'
-    runs-on: macos-latest
-    timeout-minutes: 75
-    # Explicit job-level write so release publish works even when the repo
-    # default GITHUB_TOKEN permission is "read".
-    permissions:
-      contents: write
-    env:
-      # Unsigned personal builds; script also sets CSC_IDENTITY_AUTO_DISCOVERY=false.
-      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      arch: ${{ steps.meta.outputs.arch }}
+      product_name: ${{ steps.meta.outputs.product_name }}
+      app_id: ${{ steps.meta.outputs.app_id }}
+      release_name: ${{ steps.meta.outputs.release_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version-file: package.json
-          cache: true
-          run-install: true
-
-      - name: Ensure Electron runtime is installed
-        run: vp run --filter @t3tools/desktop ensure:electron
 
       - id: meta
         name: Resolve release metadata
@@ -112,7 +114,7 @@ jobs:
           fi
 
           if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].+)?$ ]]; then
-            echo "Invalid version '${version}'. Expected semver-like value (e.g. 0.0.28-adi.3)." >&2
+            echo "Invalid version '${version}'. Expected semver-like value (e.g. 0.0.33-adi.2)." >&2
             exit 1
           fi
 
@@ -126,26 +128,192 @@ jobs:
             echo "release_name=T3 Code Adi ${version} (${arch})"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Building personal release:"
+          echo "Personal release:"
           echo "  version=${version}"
           echo "  tag=${tag}"
+          echo "  package=@adithyasak/t3@${version}"
           echo "  arch=${arch}"
           echo "  product_name=${product_name}"
           echo "  app_id=${app_id}"
 
+  publish_cli:
+    name: Publish @adithyasak/t3
+    needs: meta
+    if: github.repository_owner != 'pingdotgg' && github.event.inputs.skip_npm != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      T3CODE_CLI_PACKAGE_NAME: "@adithyasak/t3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=t3...
+              - --filter=@t3tools/web...
+              - --filter=@t3tools/scripts...
+
       - name: Align package versions to release version
-        run: node scripts/update-release-package-versions.ts "${{ steps.meta.outputs.version }}"
+        run: node scripts/update-release-package-versions.ts "${{ needs.meta.outputs.version }}"
+
+      - name: Bake production T3 Connect public config
+        run: cp .env.example .env
+
+      - name: Build web + CLI packages
+        run: vp run --filter t3 build
+
+      - name: Confirm Connect public config is baked into the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="apps/server/dist/bin.mjs"
+          if [[ ! -f "$bin" ]]; then
+            echo "Missing $bin" >&2
+            exit 1
+          fi
+          for needle in "relay.t3.codes" "pk_live_" "hzxSgY2cH10sDU2r"; do
+            if ! grep -q "$needle" "$bin"; then
+              echo "CLI bundle is missing T3 Connect public config (${needle})." >&2
+              exit 1
+            fi
+          done
+          echo "Baked T3 Connect public identifiers into $bin"
+
+          launcher="apps/server/dist/service-launcher.mjs"
+          if [[ ! -f "$launcher" ]]; then
+            echo "Missing $launcher" >&2
+            exit 1
+          fi
+          if grep -q 'node_modules/t3/dist/bin.mjs' "$launcher" || grep -q 'node_modules", "t3", "dist"' "$launcher"; then
+            echo "service-launcher still hardcodes unscoped node_modules/t3." >&2
+            exit 1
+          fi
+          if ! grep -q '@adithyasak' "$launcher"; then
+            echo "service-launcher is missing the scoped @adithyasak/t3 install path." >&2
+            exit 1
+          fi
+          echo "Service launcher resolves the scoped @adithyasak/t3 runtime"
+
+      - id: pack
+        name: Pack CLI with resolved catalog dependencies
+        run: >
+          node apps/server/scripts/cli.ts pack
+          --app-version "${{ needs.meta.outputs.version }}"
+          --package-name "${{ env.T3CODE_CLI_PACKAGE_NAME }}"
+          --repository-url "https://github.com/${{ github.repository }}"
+          --output-dir "${{ runner.temp }}/npm-pack"
+          --verbose
+
+      - name: Inspect packed package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="${{ steps.pack.outputs.tarball }}"
+          if [[ -z "$tarball" || ! -f "$tarball" ]]; then
+            echo "Pack step did not produce a tarball." >&2
+            exit 1
+          fi
+          echo "Packed tarball: $tarball"
+          python3 - <<'PY'
+          import json, os, tarfile
+          tarball = os.environ["TARBALL"]
+          expected_name = os.environ["EXPECTED_NAME"]
+          expected_version = os.environ["EXPECTED_VERSION"]
+          with tarfile.open(tarball, "r:gz") as archive:
+              member = archive.extractfile("package/package.json")
+              if member is None:
+                  raise SystemExit("package/package.json missing from tarball")
+              manifest = json.load(member)
+          print(json.dumps({
+              "name": manifest.get("name"),
+              "version": manifest.get("version"),
+              "bin": manifest.get("bin"),
+              "repository": manifest.get("repository"),
+              "dependencies": manifest.get("dependencies"),
+          }, indent=2))
+          if manifest.get("name") != expected_name:
+              raise SystemExit(f"expected name {expected_name}, got {manifest.get('name')}")
+          if manifest.get("version") != expected_version:
+              raise SystemExit(f"expected version {expected_version}, got {manifest.get('version')}")
+          if manifest.get("bin", {}).get("t3") != "./dist/bin.mjs":
+              raise SystemExit(f"expected bin.t3=./dist/bin.mjs, got {manifest.get('bin')}")
+          for name, spec in (manifest.get("dependencies") or {}).items():
+              if isinstance(spec, str) and (spec.startswith("catalog:") or spec.startswith("workspace:")):
+                  raise SystemExit(f"{name} still has unresolved spec {spec}")
+          PY
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          EXPECTED_NAME: ${{ env.T3CODE_CLI_PACKAGE_NAME }}
+          EXPECTED_VERSION: ${{ needs.meta.outputs.version }}
+
+      - name: Setup npm for Trusted Publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm CLI supports OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Publish packed package
+        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --tag latest --provenance
+
+  build_and_release:
+    name: Build macOS DMG + publish release
+    needs: [meta, publish_cli]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && (needs.publish_cli.result == 'success' || needs.publish_cli.result == 'skipped') }}
+    runs-on: macos-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    env:
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      T3CODE_CLI_PACKAGE_NAME: "@adithyasak/t3"
+      # Unsigned personal builds have no Apple application-identifier entitlement.
+      T3CODE_DESKTOP_PASSKEYS: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.meta.outputs.version }}"
+
+      - name: Bake production T3 Connect public config
+        run: cp .env.example .env
 
       - name: Build unsigned macOS DMG
         env:
-          T3CODE_DESKTOP_APP_ID: ${{ steps.meta.outputs.app_id }}
-          T3CODE_DESKTOP_PRODUCT_NAME: ${{ steps.meta.outputs.product_name }}
+          T3CODE_DESKTOP_APP_ID: ${{ needs.meta.outputs.app_id }}
+          T3CODE_DESKTOP_PRODUCT_NAME: ${{ needs.meta.outputs.product_name }}
         run: |
           vp run dist:desktop:artifact \
             --platform mac \
             --target dmg \
-            --arch "${{ steps.meta.outputs.arch }}" \
-            --build-version "${{ steps.meta.outputs.version }}" \
+            --arch "${{ needs.meta.outputs.arch }}" \
+            --build-version "${{ needs.meta.outputs.version }}" \
             --verbose
 
       - name: Collect release assets
@@ -175,22 +343,21 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: ${{ steps.meta.outputs.release_name }}
+          name: ${{ needs.meta.outputs.release_name }}
           body: |
             Personal unsigned macOS build from `${{ github.sha }}`.
 
-            - Product: `${{ steps.meta.outputs.product_name }}`
-            - Bundle id: `${{ steps.meta.outputs.app_id }}`
-            - Arch: `${{ steps.meta.outputs.arch }}`
+            - Product: `${{ needs.meta.outputs.product_name }}`
+            - Bundle id: `${{ needs.meta.outputs.app_id }}`
+            - Arch: `${{ needs.meta.outputs.arch }}`
+            - npm: `@adithyasak/t3@${{ needs.meta.outputs.version }}`
 
             Install tip: if Gatekeeper blocks the app, right-click the app → Open.
 
             After the first install, later personal builds appear as in-app updates
             (this release is a full "latest" so electron-updater can find it).
-          # Full release (not prerelease): electron-updater on the "latest" channel
-          # only queries GitHub /releases/latest, which ignores prereleases.
           prerelease: false
           make_latest: true
           files: |

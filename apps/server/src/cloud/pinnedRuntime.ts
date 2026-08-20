@@ -6,10 +6,26 @@ import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
+import {
+  cliPackageNodeModulesSegments,
+  formatCliPackageSpec,
+  normalizeCliPackageName,
+} from "@t3tools/shared/cliPackage";
+
 import * as ProcessRunner from "../processRunner.ts";
 
+declare const __T3CODE_CLI_PACKAGE_NAME__: string | undefined;
+
+function resolveCliPackageName(
+  packageName = typeof __T3CODE_CLI_PACKAGE_NAME__ === "undefined"
+    ? undefined
+    : __T3CODE_CLI_PACKAGE_NAME__,
+): string {
+  return normalizeCliPackageName(packageName);
+}
+
 /**
- * A pinned runtime is an exact `t3@<version>` npm-installed into
+ * A pinned runtime is an exact `<cli-package>@<version>` npm-installed into
  * <baseDir>/runtime/versions/<version>. The boot service points its systemd
  * unit here, and server self-update installs the target version here before
  * switching over, never `npx t3`, whose cache is ephemeral and whose
@@ -32,11 +48,18 @@ export function pinnedRuntimePaths(
   path: Path.Path,
   baseDir: string,
   version: string,
+  packageName?: string,
 ): PinnedRuntimePaths {
   const versionDir = path.join(baseDir, PINNED_RUNTIME_DIR, "versions", version);
   return {
     versionDir,
-    entryPath: path.join(versionDir, "node_modules", "t3", "dist", "bin.mjs"),
+    entryPath: path.join(
+      versionDir,
+      "node_modules",
+      ...cliPackageNodeModulesSegments(resolveCliPackageName(packageName)),
+      "dist",
+      "bin.mjs",
+    ),
     sentinelPath: path.join(versionDir, ".install-complete"),
   };
 }
@@ -71,15 +94,16 @@ export class PinnedRuntimePreflightBlockedError extends Schema.TaggedErrorClass<
 }
 
 /**
- * Installs `t3@<version>` into the pinned runtime directory unless a complete
- * install is already there, and returns its paths. The sentinel is written
- * only after npm exits 0; checking the entry file alone is not enough. npm
- * extracts files before running native builds (node-pty), so a killed
+ * Installs `<cli-package>@<version>` into the pinned runtime directory unless a
+ * complete install is already there, and returns its paths. The sentinel is
+ * written only after npm exits 0; checking the entry file alone is not enough.
+ * npm extracts files before running native builds (node-pty), so a killed
  * install leaves a plausible-looking but broken tree behind.
  */
 interface PinnedRuntimeInstallInput {
   readonly baseDir: string;
   readonly version: string;
+  readonly packageName?: string;
   readonly fs: FileSystem.FileSystem;
   readonly path: Path.Path;
   readonly runner: ProcessRunner.ProcessRunner["Service"];
@@ -92,7 +116,8 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
   input: PinnedRuntimeInstallInput,
 ) {
   const { fs, runner } = input;
-  const paths = pinnedRuntimePaths(input.path, input.baseDir, input.version);
+  const packageName = resolveCliPackageName(input.packageName);
+  const paths = pinnedRuntimePaths(input.path, input.baseDir, input.version, packageName);
   const [versionDirExists, entryExists, sentinel] = yield* Effect.all([
     fs.exists(paths.versionDir),
     fs.exists(paths.entryPath),
@@ -146,7 +171,13 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
     );
   const stagingPaths: PinnedRuntimePaths = {
     versionDir: stagingDir,
-    entryPath: input.path.join(stagingDir, "node_modules", "t3", "dist", "bin.mjs"),
+    entryPath: input.path.join(
+      stagingDir,
+      "node_modules",
+      ...cliPackageNodeModulesSegments(packageName),
+      "dist",
+      "bin.mjs",
+    ),
     sentinelPath: input.path.join(stagingDir, ".install-complete"),
   };
 
@@ -155,7 +186,14 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
     yield* runner
       .run({
         command: "npm",
-        args: ["install", "--prefix", stagingDir, "--no-fund", "--no-audit", `t3@${input.version}`],
+        args: [
+          "install",
+          "--prefix",
+          stagingDir,
+          "--no-fund",
+          "--no-audit",
+          formatCliPackageSpec(packageName, input.version),
+        ],
         // Native dependencies may compile from source on slower machines.
         timeout: PINNED_RUNTIME_INSTALL_TIMEOUT,
       })

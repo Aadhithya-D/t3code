@@ -7,6 +7,7 @@ import {
   buildVersionMismatchDismissalKey,
   dismissVersionMismatch,
   isVersionMismatchDismissed,
+  manualServerUpdateCommand,
   resolveServerConfigVersionMismatch,
   resolveServerSelfUpdateCapability,
   resolveVersionMismatch,
@@ -16,6 +17,10 @@ import {
 describe("versionSkew", () => {
   it("does not warn when versions match", () => {
     expect(resolveVersionMismatch(APP_VERSION)).toBeNull();
+  });
+
+  it("copies an npx command for the baked CLI package", () => {
+    expect(manualServerUpdateCommand("0.0.34-adi.1")).toBe("npx t3@0.0.34-adi.1");
   });
 
   it("returns a mismatch when the server version differs from the client", () => {

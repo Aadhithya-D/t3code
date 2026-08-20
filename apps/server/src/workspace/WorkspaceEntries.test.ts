@@ -121,6 +121,31 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         expect(result.truncated).toBe(false);
       }),
     );
+
+    it.effect("includes gitignored dotenv files in the file tree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-dotenv-list-", git: true });
+        yield* writeTextFile(cwd, ".gitignore", ".env*\n!.env.example\nignored.txt\n");
+        yield* writeTextFile(cwd, "src/keep.ts", "export {};");
+        yield* writeTextFile(cwd, ".env", "SECRET=1\n");
+        yield* writeTextFile(cwd, ".env.local", "SECRET=2\n");
+        yield* writeTextFile(cwd, ".env.example", "SECRET=\n");
+        yield* writeTextFile(cwd, "apps/web/.env.local", "SECRET=3\n");
+        yield* writeTextFile(cwd, "ignored.txt", "ignore me");
+
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const result = yield* workspaceEntries.list({ cwd });
+        const paths = result.entries.map((entry) => entry.path);
+
+        expect(paths).toContain("src/keep.ts");
+        expect(paths).toContain(".env");
+        expect(paths).toContain(".env.local");
+        expect(paths).toContain(".env.example");
+        expect(paths).toContain("apps/web");
+        expect(paths).toContain("apps/web/.env.local");
+        expect(paths).not.toContain("ignored.txt");
+      }),
+    );
   });
 
   describe("search", () => {
@@ -278,6 +303,23 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         expect(paths).not.toContain("ignored.txt");
         expect(paths.some((entryPath) => entryPath.startsWith(".convex/"))).toBe(false);
         expect(paths.some((entryPath) => entryPath.startsWith("convex/"))).toBe(false);
+      }),
+    );
+
+    it.effect("keeps gitignored dotenv files out of path search", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-dotenv-search-", git: true });
+        yield* writeTextFile(cwd, ".gitignore", ".env*\n!.env.example\n");
+        yield* writeTextFile(cwd, ".env", "SECRET=1\n");
+        yield* writeTextFile(cwd, ".env.local", "SECRET=2\n");
+        yield* writeTextFile(cwd, ".env.example", "SECRET=\n");
+
+        const result = yield* searchWorkspaceEntries({ cwd, query: "env", limit: 100 });
+        const paths = result.entries.map((entry) => entry.path);
+
+        expect(paths).toContain(".env.example");
+        expect(paths).not.toContain(".env");
+        expect(paths).not.toContain(".env.local");
       }),
     );
 

@@ -1,4 +1,5 @@
 import type { EnvironmentId, ServerConfig, ServerSelfUpdateCapability } from "@t3tools/contracts";
+import { formatCliPackageSpec, normalizeCliPackageName } from "@t3tools/shared/cliPackage";
 import * as Schema from "effect/Schema";
 
 import { APP_VERSION } from "./branding";
@@ -59,7 +60,8 @@ export function resolveServerSelfUpdateCapability(
 
 /** The command to hand users whose server cannot update itself. */
 export function manualServerUpdateCommand(targetVersion: string): string {
-  return `npx t3@${targetVersion}`;
+  const packageName = normalizeCliPackageName(import.meta.env.T3CODE_CLI_PACKAGE_NAME);
+  return `npx ${formatCliPackageSpec(packageName, targetVersion)}`;
 }
 
 /** One sentence telling the user how to resolve version skew for a server,

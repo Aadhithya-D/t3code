@@ -7,9 +7,10 @@ import type {
 import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer } from "electron";
 
+import { desktopPasskeysEnabled } from "./app/desktopPasskeys.ts";
 import * as IpcChannels from "./ipc/channels.ts";
 
-exposeClerkBridge({ passkeys: true });
+exposeClerkBridge({ passkeys: desktopPasskeysEnabled });
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (
@@ -98,7 +99,6 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   setWslOnly: (enabled) => ipcRenderer.invoke(IpcChannels.SET_WSL_ONLY_CHANNEL, enabled),
   pickFolder: (options) => ipcRenderer.invoke(IpcChannels.PICK_FOLDER_CHANNEL, options),
   pickThemeFiles: () => ipcRenderer.invoke(IpcChannels.PICK_THEME_FILES_CHANNEL, undefined),
-  confirm: (message) => ipcRenderer.invoke(IpcChannels.CONFIRM_CHANNEL, message),
   setTheme: (theme) => ipcRenderer.invoke(IpcChannels.SET_THEME_CHANNEL, theme),
   showContextMenu: (items, position) =>
     ipcRenderer.invoke(IpcChannels.CONTEXT_MENU_CHANNEL, {

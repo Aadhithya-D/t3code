@@ -206,6 +206,13 @@ jobs:
       contents: write
     env:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      # Same production T3 Connect public identifiers as official releases /
+      # .env.example. loadRepoEnv does not read .env.example, so CI must inject
+      # them. These are public identifiers, not secrets.
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+      T3CODE_RELAY_URL: https://relay.t3.codes
     steps:
       - name: Checkout upstream release commit
         uses: actions/checkout@v6
@@ -213,6 +220,12 @@ jobs:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.resolve.outputs.upstream_ref }}
           fetch-depth: 0
+
+      # Same as Adithya's Personal Release: bake T3 Connect public identifiers.
+      # Job-level T3CODE_* env vars still win if .env.example is empty.
+      - name: Enable production T3 Connect public config
+        shell: bash
+        run: cp .env.example .env
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1

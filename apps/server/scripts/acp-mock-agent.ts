@@ -28,6 +28,9 @@ const emitXAiAskUserQuestionThenHang =
 const emitContentThenHang = process.env.T3_ACP_EMIT_CONTENT_THEN_HANG === "1";
 const emitPlanThenHang = process.env.T3_ACP_EMIT_PLAN_THEN_HANG === "1";
 const emitActiveToolThenHang = process.env.T3_ACP_EMIT_ACTIVE_TOOL_THEN_HANG === "1";
+const emitChildSessionThenHang = process.env.T3_ACP_EMIT_CHILD_SESSION_THEN_HANG === "1";
+const emitKiroSubagentThenHang = process.env.T3_ACP_EMIT_KIRO_SUBAGENT_THEN_HANG === "1";
+const emitKiroSubagentLifecycle = process.env.T3_ACP_EMIT_KIRO_SUBAGENT_LIFECYCLE === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
@@ -612,6 +615,126 @@ const program = Effect.gen(function* () {
           },
         });
         return yield* Effect.never;
+      }
+
+      if (emitChildSessionThenHang) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "delegating to a subagent" },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: "mock-child-session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool-call-1",
+            title: "Child-only tool",
+            kind: "other",
+            status: "pending",
+            rawInput: {},
+          },
+        });
+        while (true) {
+          writeJsonRpcNotification("session/update", {
+            sessionId: "mock-child-session-1",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "child-tool-call-1",
+              status: "in_progress",
+            },
+          });
+          yield* Effect.sleep("80 millis");
+        }
+      }
+
+      if (emitKiroSubagentThenHang) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "delegating to a subagent" },
+          },
+        });
+        while (true) {
+          writeJsonRpcNotification("_kiro.dev/session/update", {
+            sessionId: "mock-child-session-1",
+            sessionUpdate: "tool_call_chunk",
+            toolCallId: "child-tool-call-1",
+            title: "Child-only tool",
+            kind: "read",
+          });
+          yield* Effect.sleep("80 millis");
+        }
+      }
+
+      if (emitKiroSubagentLifecycle) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "delegating" },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "parent-subagent-tool",
+            title: "subagent",
+            kind: "other",
+            status: "in_progress",
+            rawInput: { sessionId: "mock-child-session-1", prompt: "inspect the repo" },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: "mock-child-session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool-call-1",
+            title: "Child-only tool",
+            kind: "other",
+            status: "completed",
+            rawInput: {},
+          },
+        });
+        writeJsonRpcNotification("_kiro.dev/subagent/list_update", {
+          sessionId: requestedSessionId,
+          agents: [
+            {
+              sessionId: "mock-child-session-1",
+              status: "running",
+              title: "Explorer",
+              role: "explore",
+              lastToolName: "Child-only tool",
+            },
+          ],
+        });
+        writeJsonRpcNotification("_kiro.dev/session/inbox_notification", {
+          sessionId: requestedSessionId,
+          messageCount: 1,
+          senders: ["mock-child-session-1"],
+        });
+        writeJsonRpcNotification("_session/terminate", {
+          sessionId: "mock-child-session-1",
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "parent-subagent-tool",
+            status: "completed",
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: " subagent finished" },
+          },
+        });
+        return { stopReason: "end_turn" };
       }
 
       if (emitXAiPromptCompleteThenHang) {

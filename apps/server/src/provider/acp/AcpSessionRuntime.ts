@@ -53,7 +53,17 @@ export interface AcpSessionEventStreamBarrier {
   readonly acknowledge: Deferred.Deferred<void>;
 }
 
-export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStreamBarrier;
+export type AcpSessionRuntimeEvent =
+  | AcpParsedSessionEvent
+  | AcpChildSessionEvent
+  | AcpSessionEventStreamBarrier;
+
+export interface AcpChildSessionEvent {
+  readonly _tag: "ChildSessionEvent";
+  readonly sessionId: string;
+  /** Parsed child update. Absent when the child only sent a liveness ping. */
+  readonly event?: AcpParsedSessionEvent;
+}
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
@@ -306,8 +316,11 @@ export const make = (
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const promptSerializationSemaphore = yield* Semaphore.make(1);
-    const activePromptFiberRef = yield* Ref.make<
-      Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
+    const activePromptControlRef = yield* Ref.make<
+      Option.Option<{
+        readonly fiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+        readonly cancel: Deferred.Deferred<void>;
+      }>
     >(Option.none());
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
 
@@ -398,12 +411,32 @@ export const make = (
           return;
         }
         const startState = yield* Ref.get(startStateRef);
-        // One runtime projects one root ACP session. Child-session updates need
-        // explicit lineage routing and must never be flattened into this stream.
+        // Route child-session updates as tagged events so adapters can treat
+        // them as subagents. Never flatten their text into this session's
+        // assistant stream — that would interleave two conversations.
         if (
           startState._tag !== "Started" ||
           notification.sessionId !== startState.result.sessionId
         ) {
+          if (startState._tag === "Started") {
+            const parsed = parseSessionUpdateEvent(notification);
+            if (parsed.events.length === 0) {
+              // Thoughts, session_info, and other unparsed child updates still
+              // prove the subagent is alive for the parent watchdog.
+              yield* Queue.offer(eventQueue, {
+                _tag: "ChildSessionEvent",
+                sessionId: notification.sessionId,
+              });
+            } else {
+              for (const event of parsed.events) {
+                yield* Queue.offer(eventQueue, {
+                  _tag: "ChildSessionEvent",
+                  sessionId: notification.sessionId,
+                  event,
+                });
+              }
+            }
+          }
           return;
         }
         yield* handleSessionUpdate({
@@ -746,22 +779,31 @@ export const make = (
             const cancelledResponse = {
               stopReason: "cancelled",
             } satisfies EffectAcpSchema.PromptResponse;
+            const cancel = yield* Deferred.make<void>();
             const promptRpcFiber = yield* runLoggedRequest(
               "session/prompt",
               requestPayload,
               acp.agent.prompt(requestPayload),
             ).pipe(Effect.forkIn(runtimeScope));
-            yield* Ref.set(activePromptFiberRef, Option.some(promptRpcFiber));
-            return yield* Fiber.join(promptRpcFiber).pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.succeed(cancelledResponse)
-                  : Effect.failCause(cause),
+            yield* Ref.set(activePromptControlRef, Option.some({ fiber: promptRpcFiber, cancel }));
+            return yield* Effect.raceFirst(
+              Fiber.join(promptRpcFiber).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.succeed(cancelledResponse)
+                    : Effect.failCause(cause),
+                ),
               ),
+              Deferred.await(cancel).pipe(Effect.as(cancelledResponse)),
+            ).pipe(
               Effect.ensuring(
                 Effect.gen(function* () {
-                  yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
-                  yield* Ref.set(activePromptFiberRef, Option.none());
+                  yield* Fiber.interrupt(promptRpcFiber).pipe(
+                    Effect.ignore,
+                    Effect.forkIn(runtimeScope),
+                    Effect.asVoid,
+                  );
+                  yield* Ref.set(activePromptControlRef, Option.none());
                 }),
               ),
               Effect.tap(() =>
@@ -776,13 +818,23 @@ export const make = (
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           Effect.gen(function* () {
-            const activePromptFiber = yield* Ref.get(activePromptFiberRef);
-            if (Option.isSome(activePromptFiber)) {
-              yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
-            }
+            // Notify the agent first. If we wait to interrupt the local RPC
+            // fiber before sending `session/cancel`, an uninterruptible
+            // `session/prompt` (Kiro while tools/subagents run) never sees the
+            // cancel and Stop deadlocks the adapter lock.
             yield* acp.agent
               .cancel({ sessionId: started.sessionId })
               .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+            const active = yield* Ref.get(activePromptControlRef);
+            if (Option.isNone(active)) {
+              return;
+            }
+            yield* Deferred.succeed(active.value.cancel, undefined).pipe(Effect.ignore);
+            yield* Fiber.interrupt(active.value.fiber).pipe(
+              Effect.ignore,
+              Effect.forkIn(runtimeScope),
+              Effect.asVoid,
+            );
           }),
         ),
       ),

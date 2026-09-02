@@ -14,6 +14,9 @@ export interface KiroAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly instanceId?: ProviderInstanceId;
+  readonly turnInactivityTimeoutMs?: number;
+  readonly activeToolInactivityTimeoutMs?: number;
+  readonly concurrentPromptRetryDelaysMs?: ReadonlyArray<number>;
 }
 
 /**
@@ -23,12 +26,16 @@ export interface KiroAdapterLiveOptions {
  *
  * Effort is a Kiro-only trait: spawn with `--effort` on session start, and
  * apply mid-session changes via `/effort` when the composer toggle changes.
+ *
+ * Kiro rejects concurrent `session/prompt` calls, so a follow-up message
+ * cancels the live turn instead of Grok-style steering.
  */
 export function makeKiroAdapter(kiroSettings: KiroSettings, options?: KiroAdapterLiveOptions) {
   return makeGrokAdapter(kiroSettings, {
     ...options,
     provider: ProviderDriverKind.make("kiro"),
     providerDisplayName: "Kiro",
+    steerInFlightTurns: false,
     resolveModelId: resolveKiroAcpModelId,
     resolveSessionEffort: resolveKiroEffortFromModelSelection,
     applySessionEffort: ({ runtime, effort }) =>

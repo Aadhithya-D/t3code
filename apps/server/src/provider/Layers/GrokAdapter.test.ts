@@ -487,10 +487,24 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       const outputAfterTerminal = runtimeEvents
         .slice(terminalIndex + 1)
         .filter(
-          (event) => String(event.threadId) === String(threadId) && turnOutputTypes.has(event.type),
+          (event) =>
+            String(event.threadId) === String(threadId) &&
+            turnOutputTypes.has(event.type) &&
+            !(
+              (event.type === "item.updated" || event.type === "item.completed") &&
+              event.payload.agentId !== undefined
+            ),
         );
-      const toolTitles = runtimeEvents.flatMap((event) =>
-        event.type === "item.updated" && event.payload.title ? [event.payload.title] : [],
+      const unattributedToolTitles = runtimeEvents.flatMap((event) =>
+        event.type === "item.updated" && event.payload.title && !event.payload.agentId
+          ? [event.payload.title]
+          : [],
+      );
+      const childAgentIds = runtimeEvents.flatMap((event) =>
+        event.type === "task.started" ? [event.payload.taskId] : [],
+      );
+      const attributedChildTitles = runtimeEvents.flatMap((event) =>
+        event.type === "item.updated" && event.payload.agentId ? [event.payload.title] : [],
       );
 
       assert.equal(sendTurnResult.threadId, threadId);
@@ -498,7 +512,9 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.equal(content, "hello from mock");
       assert.isAtLeast(terminalIndex, 0);
       assert.deepEqual(outputAfterTerminal, []);
-      assert.notInclude(toolTitles, "Child-only tool");
+      assert.notInclude(unattributedToolTitles, "Child-only tool");
+      assert.include(childAgentIds, "mock-child-session-1");
+      assert.include(attributedChildTitles, "Child-only tool");
       assert.equal(turnCompletedEvent?.payload.stopReason, "end_turn");
       assert.equal(readySession?.status, "ready");
       assert.isUndefined(readySession?.activeTurnId);
@@ -858,6 +874,65 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       );
       yield* Fiber.join(sendTurnFiber);
       assert.equal(completed.payload.state, "failed");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not stall a turn while a child ACP session is still emitting", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-watchdog-child-session");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_EMIT_CHILD_SESSION_THEN_HANG: "1",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        turnInactivityTimeoutMs: 1_000,
+        activeToolInactivityTimeoutMs: 5_000,
+      });
+      const childStarted = yield* Deferred.make<void>();
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+          if (event.type === "task.started" && event.payload.taskId === "mock-child-session-1") {
+            yield* Deferred.succeed(childStarted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "run a subagent", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(childStarted).pipe(Effect.timeout("2 seconds"), TestClock.withLive);
+
+      yield* TestClock.adjust("1500 millis");
+      yield* Effect.yieldNow;
+      assert.lengthOf(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && String(event.threadId) === String(threadId),
+        ),
+        0,
+      );
+      assert.equal(
+        (yield* adapter.listSessions()).find((candidate) => candidate.threadId === threadId)
+          ?.status,
+        "running",
+      );
+
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(sendTurnFiber);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);

@@ -867,6 +867,9 @@ export function makeCursorAdapter(
                       }),
                     );
                     return;
+                  case "ThoughtDelta":
+                  case "ChildSessionEvent":
+                    return;
                 }
               }),
             ),

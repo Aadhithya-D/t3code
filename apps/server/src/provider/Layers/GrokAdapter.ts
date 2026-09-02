@@ -9,6 +9,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  RuntimeTaskId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -62,7 +63,7 @@ import {
   makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
-import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
+import { parsePermissionRequest, type AcpParsedSessionEvent } from "../acp/AcpRuntimeModel.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
   applyGrokAcpModelSelection,
@@ -84,9 +85,28 @@ import {
   XAiExitPlanModeRequest,
 } from "../acp/XAiAcpExtension.ts";
 import {
-  isPromptAlreadyInProgressMessage,
+  isAcpSubagentSpawnTool,
+  isKiroSubagentTerminalStatus,
+  isKiroVendorExtensionMethod,
+  isRetryableBusySessionPromptError,
+  KIRO_DEV_AGENT_SWITCHED_METHOD,
+  KIRO_DEV_INBOX_NOTIFICATION_METHOD,
   KIRO_DEV_METADATA_METHOD,
+  KIRO_DEV_SESSION_UPDATE_METHOD,
+  KIRO_DEV_SUBAGENT_LIST_UPDATE_METHOD,
+  KIRO_SESSION_TERMINATE_METHOD,
+  kiroSubagentEntriesFromListUpdate,
+  kiroSubagentEntryId,
+  kiroSubagentIdFromToolCall,
+  kiroVendorChildSessionId,
+  kiroVendorSessionUpdateKind,
+  kiroVendorSessionUpdateTitle,
+  KiroDevAgentSwitchedNotification,
+  KiroDevInboxNotification,
   KiroDevMetadataNotification,
+  KiroDevSessionUpdateNotification,
+  KiroSessionTerminateNotification,
+  KiroSubagentListUpdateNotification,
   threadTokenUsageFromKiroMetadata,
 } from "../acp/KiroAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
@@ -105,6 +125,12 @@ const DEFAULT_GROK_TURN_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;
 // reasoning. It still needs a deadline so a lost tool update cannot leave the
 // turn working forever.
 const DEFAULT_GROK_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1_000;
+// After Stop or a false stall-cancel, Kiro can keep the previous prompt in
+// flight for minutes. One 750ms retry is not enough; keep knocking until the
+// ghost turn drains or a non-busy error lands.
+const DEFAULT_CONCURRENT_PROMPT_RETRY_DELAYS_MS = [
+  1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000, 15_000, 15_000, 15_000, 15_000, 15_000,
+] as const;
 
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
@@ -159,6 +185,18 @@ export interface GrokAdapterLiveOptions {
   readonly turnInactivityTimeoutMs?: number;
   /** Override the longer active-tool liveness timeout in focused tests. */
   readonly activeToolInactivityTimeoutMs?: number;
+  /**
+   * Backoff between `session/prompt` retries when the agent still has a prompt
+   * in flight. Tests pass short delays; production waits long enough for a
+   * cancelled Kiro turn that kept running.
+   */
+  readonly concurrentPromptRetryDelaysMs?: ReadonlyArray<number>;
+  /**
+   * When true (Grok), a sendTurn while a prompt is in flight reuses the
+   * active turn. Kiro rejects concurrent `session/prompt` calls, so it
+   * cancels the live turn and starts a new one instead.
+   */
+  readonly steerInFlightTurns?: boolean;
 }
 
 interface PendingApproval {
@@ -207,9 +245,23 @@ interface GrokSessionContext {
   livenessTurnId: TurnId | undefined;
   lastTurnActivityAtNanos: bigint | undefined;
   readonly activeToolCallIds: Set<string>;
+  /**
+   * Child ACP sessions (Kiro subagents) still running. They rarely emit
+   * parent-session tool/content events, so the watchdog treats them like an
+   * active tool: 30-minute idle deadline, reset on every child update.
+   */
+  readonly activeChildSessionIds: Set<string>;
+  /** Child sessions that already got a `task.started` so we do not double-emit. */
+  readonly startedChildSessionIds: Set<string>;
   livenessUpdatesInFlight: number;
   /** Prompt RPCs that returned before their turn settlement acquired the lock. */
   promptResponsesReady: number;
+  /**
+   * True after T3 sent `session/cancel` while the agent may still be running
+   * the previous prompt. Follow-up `session/prompt` calls then retry bare
+   * JSON-RPC `Internal error` until the ghost turn drains.
+   */
+  acpPromptMayStillBeActive: boolean;
   currentModelId: string | undefined;
   currentReasoningEffort: string | undefined;
   /** Last applied thinking effort for providers that expose one (e.g. Kiro). */
@@ -264,6 +316,16 @@ function appendPromptResultToTurn(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeConcurrentPromptRetryDelaysMs(
+  value: ReadonlyArray<number> | undefined,
+): ReadonlyArray<number> {
+  if (value === undefined) {
+    return DEFAULT_CONCURRENT_PROMPT_RETRY_DELAYS_MS;
+  }
+  const delays = value.filter((delay) => Number.isFinite(delay) && delay >= 0).map(Math.floor);
+  return delays.length > 0 ? delays : DEFAULT_CONCURRENT_PROMPT_RETRY_DELAYS_MS;
 }
 
 const resolveNotificationTurnId = (ctx: GrokSessionContext): TurnId | undefined => ctx.activeTurnId;
@@ -437,6 +499,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         : DEFAULT_GROK_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS;
     const activeToolInactivityTimeoutNanos =
       BigInt(activeToolInactivityTimeoutMs) * NANOS_PER_MILLI;
+    const concurrentPromptRetryDelaysMs = sanitizeConcurrentPromptRetryDelaysMs(
+      options?.concurrentPromptRetryDelaysMs,
+    );
+    const steerInFlightTurns = options?.steerInFlightTurns !== false;
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -497,6 +563,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         // Grok's private reasoning phase is not present in the ACP stream.
         ctx.lastTurnActivityAtNanos = undefined;
         ctx.activeToolCallIds.clear();
+        ctx.activeChildSessionIds.clear();
       });
 
     const clearTurnLiveness = (ctx: GrokSessionContext) => {
@@ -561,7 +628,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       ctx.livenessUpdatesInFlight > 0;
 
     const livenessTimeoutFor = (ctx: GrokSessionContext) =>
-      ctx.activeToolCallIds.size > 0
+      ctx.activeToolCallIds.size > 0 || ctx.activeChildSessionIds.size > 0
         ? {
             milliseconds: activeToolInactivityTimeoutMs,
             nanos: activeToolInactivityTimeoutNanos,
@@ -585,6 +652,222 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       // Its resolution gives the provider a fresh window to resume output.
       ctx.lastTurnActivityAtNanos = yield* Clock.monotonicTimeNanos;
       yield* signalTurnLiveness(ctx, turnId);
+    });
+
+    const touchTurnLiveness = Effect.fn("GrokAdapter.touchTurnLiveness")(function* (
+      ctx: GrokSessionContext,
+      turnId: TurnId,
+    ) {
+      if (ctx.livenessTurnId !== turnId || ctx.interruptedTurnIds.has(turnId)) {
+        return;
+      }
+      ctx.lastTurnActivityAtNanos = yield* Clock.monotonicTimeNanos;
+      yield* signalTurnLiveness(ctx, turnId);
+    });
+
+    const completeChildAgent = Effect.fn("GrokAdapter.completeChildAgent")(function* (
+      ctx: GrokSessionContext,
+      childSessionId: string,
+      status: "completed" | "failed" | "stopped",
+    ) {
+      ctx.activeChildSessionIds.delete(childSessionId);
+      if (!ctx.startedChildSessionIds.delete(childSessionId)) {
+        return;
+      }
+      const turnId = resolveNotificationTurnId(ctx);
+      yield* offerRuntimeEvent({
+        type: "task.completed",
+        ...(yield* makeEventStamp()),
+        provider: PROVIDER,
+        threadId: ctx.threadId,
+        ...(turnId !== undefined ? { turnId } : {}),
+        payload: {
+          taskId: RuntimeTaskId.make(childSessionId),
+          status,
+          taskType: "subagent",
+          agentKind: "agent",
+          title: "Subagent",
+        },
+      });
+    });
+
+    const ensureChildAgentStarted = Effect.fn("GrokAdapter.ensureChildAgentStarted")(function* (
+      ctx: GrokSessionContext,
+      childSessionId: string,
+      options?: { readonly title?: string; readonly role?: string; readonly toolUseId?: string },
+    ) {
+      ctx.activeChildSessionIds.add(childSessionId);
+      const turnId = resolveNotificationTurnId(ctx);
+      if (turnId !== undefined) {
+        yield* touchTurnLiveness(ctx, turnId);
+      }
+      if (ctx.startedChildSessionIds.has(childSessionId)) {
+        if (options?.title?.trim() || options?.role?.trim()) {
+          yield* emitChildAgentProgress(ctx, childSessionId, options.title?.trim() || "Working", {
+            ...(options.title?.trim() ? { title: options.title.trim() } : {}),
+            ...(options.role?.trim() ? { role: options.role.trim() } : {}),
+          });
+        }
+        return;
+      }
+      ctx.startedChildSessionIds.add(childSessionId);
+      const title = options?.title?.trim() || "Subagent";
+      yield* offerRuntimeEvent({
+        type: "task.started",
+        ...(yield* makeEventStamp()),
+        provider: PROVIDER,
+        threadId: ctx.threadId,
+        ...(turnId !== undefined ? { turnId } : {}),
+        payload: {
+          taskId: RuntimeTaskId.make(childSessionId),
+          taskType: "subagent",
+          agentKind: "agent",
+          title,
+          description: title,
+          ...(options?.role ? { role: options.role } : {}),
+          ...(options?.toolUseId ? { toolUseId: options.toolUseId } : {}),
+        },
+      });
+    });
+
+    const emitChildAgentProgress = Effect.fn("GrokAdapter.emitChildAgentProgress")(function* (
+      ctx: GrokSessionContext,
+      childSessionId: string,
+      description: string,
+      extra?: {
+        readonly lastToolName?: string;
+        readonly summary?: string;
+        readonly title?: string;
+        readonly role?: string;
+      },
+    ) {
+      const turnId = resolveNotificationTurnId(ctx);
+      yield* offerRuntimeEvent({
+        type: "task.progress",
+        ...(yield* makeEventStamp()),
+        provider: PROVIDER,
+        threadId: ctx.threadId,
+        ...(turnId !== undefined ? { turnId } : {}),
+        payload: {
+          taskId: RuntimeTaskId.make(childSessionId),
+          description,
+          taskType: "subagent",
+          agentKind: "agent",
+          ...(extra?.summary ? { summary: extra.summary } : {}),
+          ...(extra?.lastToolName ? { lastToolName: extra.lastToolName } : {}),
+          ...(extra?.title ? { title: extra.title } : {}),
+          ...(extra?.role ? { role: extra.role } : {}),
+        },
+      });
+    });
+
+    const handleChildSessionEvent = Effect.fn("GrokAdapter.handleChildSessionEvent")(function* (
+      ctx: GrokSessionContext,
+      childSessionId: string,
+      event: AcpParsedSessionEvent | undefined,
+    ) {
+      yield* ensureChildAgentStarted(ctx, childSessionId);
+      if (!event) {
+        return;
+      }
+      switch (event._tag) {
+        case "ToolCallUpdated": {
+          const turnId = resolveNotificationTurnId(ctx);
+          yield* offerRuntimeEvent(
+            makeAcpToolCallEvent({
+              stamp: yield* makeEventStamp(),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              turnId,
+              toolCall: event.toolCall,
+              rawPayload: event.rawPayload,
+              agentId: childSessionId,
+            }),
+          );
+          yield* emitChildAgentProgress(ctx, childSessionId, event.toolCall.title ?? "Tool", {
+            lastToolName: event.toolCall.title,
+          });
+          return;
+        }
+        case "ContentDelta": {
+          const summary = event.text.trim();
+          if (summary.length === 0) {
+            return;
+          }
+          yield* emitChildAgentProgress(ctx, childSessionId, "Working", {
+            summary: summary.length > 240 ? `${summary.slice(0, 240)}…` : summary,
+          });
+          return;
+        }
+        case "ThoughtDelta":
+        case "PlanUpdated":
+        case "ModeChanged":
+        case "AssistantItemStarted":
+        case "AssistantItemCompleted":
+          return;
+      }
+    });
+
+    const cancelActiveChildAgents = (ctx: GrokSessionContext) =>
+      Effect.forEach(
+        [...ctx.activeChildSessionIds],
+        (childSessionId) => completeChildAgent(ctx, childSessionId, "stopped"),
+        { discard: true },
+      );
+
+    /**
+     * Caller must hold the thread lock. Cancels the ACP prompt (and child
+     * sessions) without waiting for the agent to finish, then settles the
+     * T3 turn so Stop / a non-steering follow-up can proceed.
+     */
+    const preemptInFlightTurnLocked = Effect.fn("GrokAdapter.preemptInFlightTurnLocked")(function* (
+      ctx: GrokSessionContext,
+    ) {
+      const interruptedTurnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
+      if (interruptedTurnId !== undefined) {
+        ctx.interruptedTurnIds.add(interruptedTurnId);
+      }
+      yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+      yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
+      ctx.acpPromptMayStillBeActive = true;
+      const childSessionIds = [...ctx.activeChildSessionIds];
+      yield* cancelActiveChildAgents(ctx);
+      yield* Effect.ignore(
+        ctx.acp.cancel.pipe(
+          Effect.mapError((error) =>
+            mapAcpToAdapterError(PROVIDER, ctx.threadId, "session/cancel", error),
+          ),
+        ),
+      );
+      yield* Effect.forEach(
+        childSessionIds,
+        (childSessionId) =>
+          ctx.acp.notify("session/cancel", { sessionId: childSessionId }).pipe(Effect.ignore),
+        { discard: true },
+      );
+      if (interruptedTurnId) {
+        yield* settlePromptInFlight(ctx.threadId, interruptedTurnId, ctx.acpSessionId, {
+          completedStopReason: "cancelled",
+          settleAllPrompts: true,
+        });
+        return;
+      }
+      if (
+        ctx.promptsInFlight > 0 ||
+        ctx.session.status === "running" ||
+        ctx.session.status === "connecting"
+      ) {
+        const updatedAt = yield* nowIso;
+        ctx.promptsInFlight = 0;
+        ctx.activeTurnId = undefined;
+        const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+        ctx.session = {
+          ...readySession,
+          status: "ready",
+          updatedAt,
+        };
+        yield* clearTurnLiveness(ctx);
+      }
     });
 
     const refreshSessionTurnLiveness = Effect.fn("GrokAdapter.refreshSessionTurnLiveness")(
@@ -840,6 +1123,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           // Mark before cancel/drain so notifications already in flight finish
           // before the terminal event, while late notifications are dropped.
           ctx.interruptedTurnIds.add(turnId);
+          ctx.acpPromptMayStillBeActive = true;
+          yield* cancelActiveChildAgents(ctx);
           yield* Effect.ignore(
             ctx.acp.cancel.pipe(
               Effect.mapError((error) =>
@@ -1234,11 +1519,17 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     if (liveCtx && reportedEffort) {
                       liveCtx.currentEffort = reportedEffort;
                     }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (liveCtx && turnId !== undefined) {
+                      // Thinking, subagents, and credit pings do not emit ACP
+                      // tool/content events. Count metadata as liveness so the
+                      // watchdog does not cancel a live Kiro turn.
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
                     const usage = threadTokenUsageFromKiroMetadata(params);
                     if (!usage) {
                       return;
                     }
-                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
                     yield* offerRuntimeEvent({
                       type: "thread.token-usage.updated",
                       ...(yield* makeEventStamp()),
@@ -1254,6 +1545,175 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     });
                   }),
                 ),
+            );
+            yield* acp.handleExtNotification(
+              KIRO_DEV_SUBAGENT_LIST_UPDATE_METHOD,
+              KiroSubagentListUpdateNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_DEV_SUBAGENT_LIST_UPDATE_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    if (!liveCtx) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (turnId !== undefined) {
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
+                    for (const entry of kiroSubagentEntriesFromListUpdate(params)) {
+                      const childId = kiroSubagentEntryId(entry);
+                      if (!childId) {
+                        continue;
+                      }
+                      const title =
+                        entry.title?.trim() || entry.name?.trim() || entry.description?.trim();
+                      if (isKiroSubagentTerminalStatus(entry.status)) {
+                        yield* completeChildAgent(
+                          liveCtx,
+                          childId,
+                          entry.status?.toLowerCase() === "failed" ? "failed" : "completed",
+                        );
+                        continue;
+                      }
+                      yield* ensureChildAgentStarted(liveCtx, childId, {
+                        ...(title ? { title } : {}),
+                        ...(entry.role?.trim() ? { role: entry.role.trim() } : {}),
+                      });
+                      if (entry.lastToolName?.trim() || title || entry.role?.trim()) {
+                        yield* emitChildAgentProgress(
+                          liveCtx,
+                          childId,
+                          entry.lastToolName?.trim() || title || "Working",
+                          {
+                            ...(entry.lastToolName?.trim()
+                              ? { lastToolName: entry.lastToolName.trim() }
+                              : {}),
+                            ...(title ? { title } : {}),
+                            ...(entry.role?.trim() ? { role: entry.role.trim() } : {}),
+                          },
+                        );
+                      }
+                    }
+                  }),
+                ),
+            );
+            yield* acp.handleExtNotification(
+              KIRO_SESSION_TERMINATE_METHOD,
+              KiroSessionTerminateNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_SESSION_TERMINATE_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    if (!liveCtx) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (turnId !== undefined) {
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
+                    yield* completeChildAgent(liveCtx, params.sessionId, "completed");
+                  }),
+                ),
+            );
+            yield* acp.handleExtNotification(
+              KIRO_DEV_SESSION_UPDATE_METHOD,
+              KiroDevSessionUpdateNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_DEV_SESSION_UPDATE_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    if (!liveCtx) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (turnId !== undefined) {
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
+                    const childId = kiroVendorChildSessionId(params, liveCtx.acpSessionId);
+                    if (!childId) {
+                      return;
+                    }
+                    const title = kiroVendorSessionUpdateTitle(params);
+                    const kind = kiroVendorSessionUpdateKind(params);
+                    yield* ensureChildAgentStarted(liveCtx, childId, {
+                      ...(title ? { title } : {}),
+                    });
+                    if (kind === "tool_call_chunk" || title) {
+                      yield* emitChildAgentProgress(liveCtx, childId, title ?? "Working", {
+                        ...(title ? { lastToolName: title } : {}),
+                      });
+                    }
+                  }),
+                ),
+            );
+            yield* acp.handleExtNotification(
+              KIRO_DEV_INBOX_NOTIFICATION_METHOD,
+              KiroDevInboxNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_DEV_INBOX_NOTIFICATION_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    if (!liveCtx) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (turnId !== undefined) {
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
+                    const senders =
+                      params.senders?.filter((sender) => sender.trim().length > 0) ?? [];
+                    const count =
+                      params.messageCount !== undefined && Number.isFinite(params.messageCount)
+                        ? Math.max(0, Math.trunc(params.messageCount))
+                        : senders.length;
+                    const summary = count > 0 ? `Results received (${count})` : "Results received";
+                    for (const sender of senders.length > 0 ? senders : [params.sessionId ?? ""]) {
+                      const childId = sender.trim();
+                      if (!childId || childId === liveCtx.acpSessionId) {
+                        continue;
+                      }
+                      yield* ensureChildAgentStarted(liveCtx, childId);
+                      yield* emitChildAgentProgress(liveCtx, childId, summary, { summary });
+                    }
+                  }),
+                ),
+            );
+            yield* acp.handleExtNotification(
+              KIRO_DEV_AGENT_SWITCHED_METHOD,
+              KiroDevAgentSwitchedNotification,
+              (params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, KIRO_DEV_AGENT_SWITCHED_METHOD, params);
+                    const liveCtx = sessions.get(input.threadId);
+                    if (!liveCtx) {
+                      return;
+                    }
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    if (turnId !== undefined) {
+                      yield* touchTurnLiveness(liveCtx, turnId);
+                    }
+                  }),
+                ),
+            );
+            yield* acp.handleUnknownExtNotification((method, params) =>
+              mapAcpCallbackFailure(
+                Effect.gen(function* () {
+                  if (!isKiroVendorExtensionMethod(method)) {
+                    return;
+                  }
+                  yield* logNative(input.threadId, method, params);
+                  const liveCtx = sessions.get(input.threadId);
+                  const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                  if (liveCtx && turnId !== undefined) {
+                    yield* touchTurnLiveness(liveCtx, turnId);
+                  }
+                }),
+              ),
             );
             yield* acp.handleRequestPermission((params) =>
               mapAcpCallbackFailure(
@@ -1468,8 +1928,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             livenessTurnId: undefined,
             lastTurnActivityAtNanos: undefined,
             activeToolCallIds: new Set(),
+            activeChildSessionIds: new Set(),
+            startedChildSessionIds: new Set(),
             livenessUpdatesInFlight: 0,
             promptResponsesReady: 0,
+            acpPromptMayStillBeActive: false,
             currentModelId: boundModelId,
             currentReasoningEffort:
               requestedStartReasoningEffort !== undefined
@@ -1486,6 +1949,18 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               Effect.gen(function* () {
                 if (event._tag === "EventStreamBarrier") {
                   yield* Deferred.succeed(event.acknowledge, undefined);
+                  return;
+                }
+                if (event._tag === "ChildSessionEvent") {
+                  yield* logNative(ctx.threadId, "session/update", event.event ?? event);
+                  const childTurnId = resolveNotificationTurnId(ctx);
+                  if (childTurnId !== undefined) {
+                    ctx.activeChildSessionIds.add(event.sessionId);
+                    yield* touchTurnLiveness(ctx, childTurnId);
+                  }
+                  if (!ctx.suppressContentEvents) {
+                    yield* handleChildSessionEvent(ctx, event.sessionId, event.event);
+                  }
                   return;
                 }
                 if (
@@ -1506,6 +1981,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   ctx.interruptedTurnIds.has(notificationTurnId) ||
                   ctx.suppressContentEvents
                 ) {
+                  return;
+                }
+                if (event._tag === "ThoughtDelta") {
+                  yield* touchTurnLiveness(ctx, notificationTurnId);
                   return;
                 }
                 if (
@@ -1566,6 +2045,16 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         rawPayload: event.rawPayload,
                       }),
                     );
+                    if (isAcpSubagentSpawnTool(event.toolCall)) {
+                      const childId = kiroSubagentIdFromToolCall(event.toolCall);
+                      // The spawn tool completing only means Kiro accepted the
+                      // launch. The child keeps running until terminate / list
+                      // update, so do not complete the task here.
+                      yield* ensureChildAgentStarted(ctx, childId, {
+                        title: event.toolCall.title,
+                        toolUseId: event.toolCall.toolCallId,
+                      });
+                    }
                     ctx.planModeActive = nextGrokPlanModeActive(ctx.planModeActive, event.toolCall);
                     // Only promote session plan.md writes while plan mode is
                     // active — avoids treating unrelated plan files as proposals.
@@ -1658,10 +2147,23 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
-            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+            // Kiro (and any adapter with steer disabled) cannot fold a second
+            // `session/prompt` into the live turn. Cancel first, then open a
+            // new turn. Also refuse to steer a turn Stop already cancelled.
+            if (
+              ctx.promptsInFlight > 0 &&
+              (!steerInFlightTurns ||
+                ctx.activeTurnId === undefined ||
+                ctx.interruptedTurnIds.has(ctx.activeTurnId))
+            ) {
+              yield* preemptInFlightTurnLocked(ctx);
+            }
+            const canSteer =
+              steerInFlightTurns &&
+              ctx.promptsInFlight > 0 &&
+              ctx.activeTurnId !== undefined &&
+              !ctx.interruptedTurnIds.has(ctx.activeTurnId);
+            const steeringTurnId = canSteer ? ctx.activeTurnId : undefined;
             const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
             // Count this prompt immediately so a superseded in-flight prompt
             // resolving from here on does not settle the turn; decremented on
@@ -1855,55 +2357,78 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           /**
            * Kiro (and similar ACP agents) reject a follow-up prompt while they
            * still consider the previous one in flight — common right after
-           * Stop/cancel while residual tools finish. Cancel once more, give
-           * the agent a short settle window, and retry a single time so multi-
-           * turn chat does not fail with "unable to start turn".
+           * Stop/cancel while residual tools finish. Keep cancelling and
+           * backing off until the ghost turn drains; Kiro often reports that
+           * as JSON-RPC `Internal error` with the real reason in `error.data`.
            */
-          const result = yield* prepared.acp
-            .prompt({
+          const promptOnce = () =>
+            prepared.acp.prompt({
               prompt: prepared.promptParts,
-            })
-            .pipe(
-              Effect.catch((error) => {
-                const mapped = mapAcpToAdapterError(
-                  PROVIDER,
-                  input.threadId,
-                  "session/prompt",
-                  error,
-                );
-                if (!isPromptAlreadyInProgressMessage(mapped.message)) {
-                  return Effect.fail(error);
-                }
-                return prepared.acp.cancel.pipe(
-                  Effect.ignore,
-                  Effect.andThen(Effect.sleep(Duration.millis(750))),
-                  Effect.andThen(
-                    prepared.acp.prompt({
-                      prompt: prepared.promptParts,
-                    }),
-                  ),
-                );
-              }),
-              Effect.tap((promptResult) =>
-                Effect.all(
-                  [
-                    Ref.set(promptRpcSucceeded, true),
-                    Ref.set(promptResultRef, promptResult),
-                    markPromptResponseReady(input.threadId, prepared.acpSessionId, prepared.turnId),
-                  ],
-                  { discard: true },
-                ),
-              ),
-              Effect.tapError((error) =>
-                Ref.set(
-                  promptFailureMessageRef,
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
-                ).pipe(Effect.andThen(prepared.acp.drainEvents)),
-              ),
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
+            });
+          const shouldRetryBusyPrompt = (error: EffectAcpErrors.AcpError) => {
+            const mapped = mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error);
+            const recentlyCancelled =
+              sessions.get(input.threadId)?.acpPromptMayStillBeActive === true;
+            return (
+              isRetryableBusySessionPromptError(error, { recentlyCancelled }) ||
+              isRetryableBusySessionPromptError(mapped, { recentlyCancelled })
             );
+          };
+          const result = yield* promptOnce().pipe(
+            Effect.catch((error) => {
+              if (!shouldRetryBusyPrompt(error)) {
+                return Effect.fail(error);
+              }
+              return Effect.gen(function* () {
+                let lastError = error;
+                for (const delayMs of concurrentPromptRetryDelaysMs) {
+                  yield* prepared.acp.cancel.pipe(Effect.ignore);
+                  if (delayMs > 0) {
+                    yield* Effect.sleep(Duration.millis(delayMs));
+                  }
+                  const attempt = yield* promptOnce().pipe(
+                    Effect.map((value) => ({ ok: true as const, value })),
+                    Effect.catch((nextError) =>
+                      Effect.succeed({ ok: false as const, error: nextError }),
+                    ),
+                  );
+                  if (attempt.ok) {
+                    return attempt.value;
+                  }
+                  lastError = attempt.error;
+                  if (!shouldRetryBusyPrompt(lastError)) {
+                    return yield* Effect.fail(lastError);
+                  }
+                }
+                return yield* Effect.fail(lastError);
+              });
+            }),
+            Effect.tap((promptResult) =>
+              Effect.all(
+                [
+                  Ref.set(promptRpcSucceeded, true),
+                  Ref.set(promptResultRef, promptResult),
+                  Effect.sync(() => {
+                    const liveCtx = sessions.get(input.threadId);
+                    if (liveCtx) {
+                      liveCtx.acpPromptMayStillBeActive = false;
+                    }
+                  }),
+                  markPromptResponseReady(input.threadId, prepared.acpSessionId, prepared.turnId),
+                ],
+                { discard: true },
+              ),
+            ),
+            Effect.tapError((error) =>
+              Ref.set(
+                promptFailureMessageRef,
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error).message,
+              ).pipe(Effect.andThen(prepared.acp.drainEvents)),
+            ),
+            Effect.mapError((error) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+            ),
+          );
 
           return yield* withThreadLock(
             input.threadId,
@@ -2138,37 +2663,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             }
             const interruptedTurnId =
               observed.interruptedTurnId ?? turnId ?? activeTurnId ?? ctx.session.activeTurnId;
-            yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
-            yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
-            yield* Effect.ignore(
-              ctx.acp.cancel.pipe(
-                Effect.mapError((error) =>
-                  mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
-                ),
-              ),
-            );
-            if (interruptedTurnId) {
+            if (interruptedTurnId !== undefined) {
               ctx.interruptedTurnIds.add(interruptedTurnId);
-              yield* settlePromptInFlight(threadId, interruptedTurnId, ctx.acpSessionId, {
-                completedStopReason: "cancelled",
-                settleAllPrompts: true,
-              });
-            } else if (
-              ctx.promptsInFlight > 0 ||
-              ctx.session.status === "running" ||
-              ctx.session.status === "connecting"
-            ) {
-              const updatedAt = yield* nowIso;
-              ctx.promptsInFlight = 0;
-              ctx.activeTurnId = undefined;
-              const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-              ctx.session = {
-                ...readySession,
-                status: "ready",
-                updatedAt,
-              };
-              yield* clearTurnLiveness(ctx);
             }
+            yield* preemptInFlightTurnLocked(ctx);
           }),
         );
       });

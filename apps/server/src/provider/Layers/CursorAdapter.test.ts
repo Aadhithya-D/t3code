@@ -293,8 +293,8 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         const firstItemId = yield* captureAssistantItemId(ThreadId.make("cursor-resume-safety-1"));
         const secondItemId = yield* captureAssistantItemId(ThreadId.make("cursor-resume-safety-2"));
 
-        assert.match(firstItemId, /^assistant:mock-session-1:[a-z0-9-]+:segment:0$/);
-        assert.match(secondItemId, /^assistant:mock-session-1:[a-z0-9-]+:segment:0$/);
+        assert.match(firstItemId, /^assistant:mock-session-1:(?:runtime:)?[a-z0-9-]+:segment:0$/);
+        assert.match(secondItemId, /^assistant:mock-session-1:(?:runtime:)?[a-z0-9-]+:segment:0$/);
         assert.notEqual(firstItemId, secondItemId);
       }),
   );

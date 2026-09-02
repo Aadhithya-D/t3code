@@ -64,6 +64,7 @@ vi.mock("./usageProviders", async (importOriginal) => {
     PROVIDER_PRESENTATION: {
       codex: { color: "white", label: "Codex", mark: "span" },
       claude: { color: "orange", label: "Claude Code", mark: "span" },
+      grok: { color: "gray", label: "Grok Build", mark: "span" },
       kiro: { color: "purple", label: "Kiro CLI", mark: "span" },
     },
   };

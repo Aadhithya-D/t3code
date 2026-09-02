@@ -6,6 +6,7 @@ import * as NodeFS from "node:fs";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -153,30 +154,47 @@ describe("AcpSessionRuntime", () => {
     }).pipe(Effect.provide(NodeServices.layer));
   });
 
-  it.effect("drops session updates emitted for a child ACP session", () =>
+  it.effect("routes child ACP session updates without flattening them into the parent stream", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
       yield* runtime.start();
+      const notes: AcpSessionRuntime.AcpSessionRuntimeEvent[] = [];
+      const collector = yield* Stream.runForEach(runtime.getEvents(), (note) => {
+        if (note._tag === "EventStreamBarrier") {
+          return Deferred.succeed(note.acknowledge, undefined);
+        }
+        notes.push(note);
+        return Effect.void;
+      }).pipe(Effect.forkChild);
 
       const promptResult = yield* runtime.prompt({
         prompt: [{ type: "text", text: "hi" }],
       });
       expect(promptResult).toMatchObject({ stopReason: "end_turn" });
+      yield* runtime.drainEvents;
+      yield* Fiber.interrupt(collector);
 
-      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
-      expect(notes.map((note) => note._tag)).toEqual([
+      const parentNotes = notes.filter(
+        (note) => note._tag !== "ChildSessionEvent" && note._tag !== "EventStreamBarrier",
+      );
+      const childNotes = notes.filter(
+        (note): note is Extract<(typeof notes)[number], { _tag: "ChildSessionEvent" }> =>
+          note._tag === "ChildSessionEvent",
+      );
+      expect(parentNotes.map((note) => note._tag)).toEqual([
         "AssistantItemStarted",
         "ContentDelta",
         "ContentDelta",
         "AssistantItemCompleted",
       ]);
       expect(
-        notes
+        parentNotes
           .filter((note) => note._tag === "ContentDelta")
           .map((note) => note.text)
           .join(""),
       ).toBe("root before child root after child");
-      expect(notes.some((note) => note._tag === "ToolCallUpdated")).toBe(false);
+      expect(childNotes.some((note) => note.event?._tag === "ToolCallUpdated")).toBe(true);
+      expect(childNotes.some((note) => note.sessionId === "mock-child-session-1")).toBe(true);
     }).pipe(
       Effect.provide(
         AcpSessionRuntime.layer({
@@ -330,7 +348,7 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
-  it.effect("suppresses generic placeholder tool updates until completion", () =>
+  it.effect("emits status-only tool updates through completion", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
       yield* runtime.start();
@@ -340,13 +358,22 @@ describe("AcpSessionRuntime", () => {
       });
       expect(promptResult).toMatchObject({ stopReason: "end_turn" });
 
-      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 1)));
-      expect(notes.map((note) => note._tag)).toEqual(["ToolCallUpdated"]);
-      const toolCall = notes[0];
-      expect(toolCall?._tag).toBe("ToolCallUpdated");
-      if (toolCall?._tag === "ToolCallUpdated") {
-        expect(toolCall.toolCall.status).toBe("completed");
-        expect(toolCall.toolCall.title).toBe("Read file");
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 3)));
+      expect(notes.map((note) => note._tag)).toEqual([
+        "ToolCallUpdated",
+        "ToolCallUpdated",
+        "ToolCallUpdated",
+      ]);
+      const toolCalls = notes.flatMap((note) =>
+        note._tag === "ToolCallUpdated" ? [note.toolCall] : [],
+      );
+      expect(toolCalls.map((toolCall) => toolCall.status)).toEqual([
+        "pending",
+        "inProgress",
+        "completed",
+      ]);
+      for (const toolCall of toolCalls) {
+        expect(toolCall.title).toBe("Read file");
       }
     }).pipe(
       Effect.provide(

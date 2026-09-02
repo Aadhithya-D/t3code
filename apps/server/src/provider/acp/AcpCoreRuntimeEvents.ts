@@ -164,6 +164,7 @@ export function makeAcpToolCallEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly toolCall: AcpToolCallState;
   readonly rawPayload: unknown;
+  readonly agentId?: string;
 }): ProviderRuntimeEvent {
   const runtimeStatus = runtimeItemStatusFromAcpToolStatus(input.toolCall.status);
   return {
@@ -182,6 +183,7 @@ export function makeAcpToolCallEvent(input: {
       ...(input.toolCall.title ? { title: input.toolCall.title } : {}),
       ...(input.toolCall.detail ? { detail: input.toolCall.detail } : {}),
       ...(Object.keys(input.toolCall.data).length > 0 ? { data: input.toolCall.data } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
     },
     raw: {
       source: "acp.jsonrpc",

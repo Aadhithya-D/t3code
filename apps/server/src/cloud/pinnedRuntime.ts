@@ -26,8 +26,8 @@ function resolveCliPackageName(
 
 /**
  * A pinned runtime is an exact `<cli-package>@<version>` npm-installed into
- * <baseDir>/runtime/versions/<version>. The boot service points its systemd
- * unit here, and server self-update installs the target version here before
+ * <baseDir>/runtime/versions/<version>. The boot service points its unit or
+ * launch agent here, and server self-update installs the target version here before
  * switching over, never `npx t3`, whose cache is ephemeral and whose
  * registry fetch at boot would make startup depend on the network.
  */

@@ -70,7 +70,8 @@ let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
-const cancelledSessions = new Set<string>();
+/** Session id → promptCount that was in flight when cancel arrived. */
+const cancelledSessions = new Map<string, number>();
 
 function promptIdFromRequestMeta(
   request: Pick<AcpSchema.PromptRequest, "_meta">,
@@ -457,7 +458,7 @@ const program = Effect.gen(function* () {
   yield* agent.handleCancel(({ sessionId }) =>
     Effect.gen(function* () {
       const cancelledSessionId = String(sessionId ?? "mock-session-1");
-      cancelledSessions.add(cancelledSessionId);
+      cancelledSessions.set(cancelledSessionId, promptCount);
       if (emitLateUpdateAfterCancel) {
         yield* Effect.sleep("50 millis");
         yield* Effect.sync(() => {
@@ -753,7 +754,12 @@ const program = Effect.gen(function* () {
           { optionId: permissionOptionIds.rejectOnce, name: "Reject", kind: "reject_once" },
         ];
 
-        let cancelled = cancelledSessions.delete(requestedSessionId);
+        const cancelledPromptCount = cancelledSessions.get(requestedSessionId);
+        const cancelledBySessionState = cancelledPromptCount === promptCount;
+        if (cancelledPromptCount !== undefined && cancelledPromptCount <= promptCount) {
+          cancelledSessions.delete(requestedSessionId);
+        }
+        let cancelled = cancelledBySessionState;
         for (let index = 0; index < permissionRequestCount; index++) {
           const command =
             index > 0
@@ -783,9 +789,13 @@ const program = Effect.gen(function* () {
             },
             options: permissionOptions,
           });
+          const cancelledDuringPrompt = cancelledSessions.get(requestedSessionId);
+          if (cancelledDuringPrompt !== undefined && cancelledDuringPrompt <= promptCount) {
+            cancelledSessions.delete(requestedSessionId);
+          }
           cancelled =
             cancelled ||
-            cancelledSessions.delete(requestedSessionId) ||
+            cancelledDuringPrompt === promptCount ||
             permission.outcome.outcome === "cancelled";
           if (cancelled) {
             break;

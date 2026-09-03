@@ -543,4 +543,155 @@ it.layer(testLayer)("KiroAdapter", (it) => {
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
   );
+
+  it.effect("does not treat parent-session Kiro tool chunks as subagents", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-parent-tool-chunk");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_EMIT_KIRO_PARENT_TOOL_CHUNK: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }));
+      const events: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          events.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "find the files",
+        attachments: [],
+      });
+      yield* Deferred.await(turnCompleted);
+
+      assert.isFalse(events.some((event) => event.type === "task.started"));
+      assert.isFalse(events.some((event) => event.type === "task.completed"));
+      assert.isTrue(
+        events.some(
+          (event) => event.type === "item.updated" && event.payload.title === "glob",
+        ),
+      );
+      const completed = events.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "completed");
+      }
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("keeps a Kiro turn alive from child-session metadata without a subagent row", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-child-metadata-liveness");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_EMIT_KIRO_CHILD_METADATA_THEN_HANG: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
+        turnInactivityTimeoutMs: 400,
+        activeToolInactivityTimeoutMs: 8_000,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const usageSeen = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          events.push(event);
+          if (event.type === "thread.token-usage.updated") {
+            yield* Deferred.succeed(usageSeen, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "spawn a crew", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(usageSeen);
+      yield* Effect.sleep("900 millis");
+      assert.lengthOf(
+        events.filter((event) => event.type === "turn.completed"),
+        0,
+      );
+      assert.isFalse(events.some((event) => event.type === "task.started"));
+
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(sendTurnFiber);
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("counts parent-session Kiro tool chunks as watchdog liveness only", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-parent-tool-chunk-liveness");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_EMIT_KIRO_PARENT_TOOL_CHUNK_THEN_HANG: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
+        turnInactivityTimeoutMs: 400,
+        activeToolInactivityTimeoutMs: 8_000,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const toolSeen = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          events.push(event);
+          if (event.type === "item.updated" && event.payload.title === "glob") {
+            yield* Deferred.succeed(toolSeen, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "keep searching", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(toolSeen);
+      yield* Effect.sleep("900 millis");
+      assert.lengthOf(
+        events.filter((event) => event.type === "turn.completed"),
+        0,
+      );
+      assert.isFalse(events.some((event) => event.type === "task.started"));
+
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(sendTurnFiber);
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
 });

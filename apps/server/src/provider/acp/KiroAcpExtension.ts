@@ -337,6 +337,11 @@ export function kiroVendorSessionUpdateKind(
   );
 }
 
+/**
+ * Only a distinct ACP session id is a subagent. Parent-session
+ * `_kiro.dev/session/update` tool chunks reuse the root sessionId and put the
+ * ordinary tool id on `toolCallId` — that must not become a child agent.
+ */
 export function kiroVendorChildSessionId(
   notification: KiroDevSessionUpdateNotification,
   parentSessionId: string | undefined,
@@ -345,9 +350,7 @@ export function kiroVendorChildSessionId(
   if (sessionId && sessionId !== parentSessionId) {
     return sessionId;
   }
-  return (
-    trimmedNonEmpty(notification.toolCallId) ?? trimmedNonEmpty(notification.update?.toolCallId)
-  );
+  return undefined;
 }
 
 export function kiroVendorSessionUpdateTitle(

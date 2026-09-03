@@ -808,12 +808,28 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       }
     });
 
-    const cancelActiveChildAgents = (ctx: GrokSessionContext) =>
+    const settleActiveChildAgents = (
+      ctx: GrokSessionContext,
+      status: "completed" | "failed" | "stopped",
+    ) =>
       Effect.forEach(
         [...ctx.activeChildSessionIds],
-        (childSessionId) => completeChildAgent(ctx, childSessionId, "stopped"),
+        (childSessionId) => completeChildAgent(ctx, childSessionId, status),
         { discard: true },
       );
+
+    const cancelActiveChildAgents = (ctx: GrokSessionContext) =>
+      settleActiveChildAgents(ctx, "stopped");
+
+    const leftoverChildStatusForSettlement = (options?: {
+      readonly errorMessage?: string;
+      readonly completedStopReason?: EffectAcpSchema.StopReason | null;
+    }) =>
+      options?.errorMessage !== undefined
+        ? ("failed" as const)
+        : options?.completedStopReason === "cancelled"
+          ? ("stopped" as const)
+          : ("completed" as const);
 
     /**
      * Caller must hold the thread lock. Cancels the ACP prompt (and child
@@ -1013,6 +1029,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   updatedAt,
                 };
               }
+              yield* settleActiveChildAgents(liveCtx, leftoverChildStatusForSettlement(options));
               yield* clearTurnLiveness(liveCtx);
               return;
             }
@@ -1030,6 +1047,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           }
           liveCtx.promptsInFlight = remainingPrompts;
         }
+        yield* settleActiveChildAgents(liveCtx, leftoverChildStatusForSettlement(options));
         yield* clearTurnLiveness(liveCtx);
         const updatedAt = yield* nowIso;
         const canEmitTurnCompletion =
@@ -1521,6 +1539,12 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     }
                     const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
                     if (liveCtx && turnId !== undefined) {
+                      // Child crews often only ping metadata on their own
+                      // sessionId. Track them for the longer idle deadline
+                      // without opening an Agents-panel row.
+                      if (params.sessionId && params.sessionId !== liveCtx.acpSessionId) {
+                        liveCtx.activeChildSessionIds.add(params.sessionId);
+                      }
                       // Thinking, subagents, and credit pings do not emit ACP
                       // tool/content events. Count metadata as liveness so the
                       // watchdog does not cancel a live Kiro turn.
@@ -1633,6 +1657,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       yield* touchTurnLiveness(liveCtx, turnId);
                     }
                     const childId = kiroVendorChildSessionId(params, liveCtx.acpSessionId);
+                    // Parent-session tool_call_chunks are ordinary tools.
+                    // Only a distinct child sessionId starts a subagent row.
                     if (!childId) {
                       return;
                     }
@@ -1719,6 +1745,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               mapAcpCallbackFailure(
                 Effect.gen(function* () {
                   yield* logNative(input.threadId, "session/request_permission", params);
+                  const liveCtx = sessions.get(input.threadId);
+                  const permissionTurnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                  if (liveCtx && permissionTurnId !== undefined) {
+                    if (params.sessionId && params.sessionId !== liveCtx.acpSessionId) {
+                      liveCtx.activeChildSessionIds.add(params.sessionId);
+                    }
+                    yield* touchTurnLiveness(liveCtx, permissionTurnId);
+                  }
                   const permissionRequest = parsePermissionRequest(params);
                   const command = permissionRequest.toolCall?.command;
                   const { kind, title, rawInput, locations } = params.toolCall;

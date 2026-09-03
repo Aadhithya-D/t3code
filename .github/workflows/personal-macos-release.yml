@@ -1,5 +1,6 @@
-# Personal fork release: publish @adithyasak/t3 and the unsigned macOS DMG at the
-# same version. One dispatch or one personal-v* tag updates both.
+# Personal fork release: publish @adithyasak/t3 plus unsigned macOS DMG and
+# Windows NSIS at the same version. One dispatch or one personal-v* tag
+# updates npm and both desktop artifacts.
 #
 # Why this exists: upstream Release/CI jobs use private Blacksmith runners and
 # org-only relay/npm config, so they never start on personal forks.
@@ -16,12 +17,12 @@
 #
 # Remote CLI:
 #   Desktop SSH launch installs @adithyasak/t3@<this version>. npm is published
-#   first so that package exists before the DMG is released.
+#   first so that package exists before the desktop artifacts are released.
 #
 # Usage:
-#   1. Actions → "Personal Release" → Run workflow (same version for npm + Mac)
+#   1. Actions → "Personal Release" → Run workflow (same version for npm + Mac + Win)
 #   2. Or push a tag: personal-v0.0.33-adi.3
-#   3. First install: download the DMG from the GitHub Release once
+#   3. First install: download the DMG or NSIS from the GitHub Release once
 #   4. Later versions: open T3 Code Adi → Check for Updates
 name: Personal Release
 
@@ -29,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Shared version for npm + Mac (e.g. 0.0.33-adi.2). Empty = package.json version + -adi.<run_number>"
+        description: "Shared version for npm + Mac + Windows (e.g. 0.0.33-adi.2). Empty = package.json version + -adi.<run_number>"
         required: false
         type: string
       arch:
@@ -46,12 +47,12 @@ on:
         default: T3 Code Adi
         type: string
       app_id:
-        description: "macOS bundle id (must differ from official com.t3tools.t3code)"
+        description: "App / bundle id (must differ from official com.t3tools.t3code)"
         required: false
         default: com.t3tools.t3code.adi
         type: string
       skip_npm:
-        description: "Skip npm publish (Mac-only; versions will drift)"
+        description: "Skip npm publish (desktop-only; versions will drift)"
         required: false
         default: false
         type: boolean
@@ -125,7 +126,7 @@ jobs:
             echo "arch=${arch}"
             echo "product_name=${product_name}"
             echo "app_id=${app_id}"
-            echo "release_name=T3 Code Adi ${version} (${arch})"
+            echo "release_name=T3 Code Adi ${version}"
           } >> "${GITHUB_OUTPUT}"
 
           echo "Personal release:"
@@ -347,14 +348,16 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: ${{ needs.meta.outputs.release_name }}
           body: |
-            Personal unsigned macOS build from `${{ github.sha }}`.
+            Personal unsigned desktop build from `${{ github.sha }}`.
 
             - Product: `${{ needs.meta.outputs.product_name }}`
-            - Bundle id: `${{ needs.meta.outputs.app_id }}`
-            - Arch: `${{ needs.meta.outputs.arch }}`
+            - Bundle / app id: `${{ needs.meta.outputs.app_id }}`
+            - macOS: `${{ needs.meta.outputs.arch }}` DMG
+            - Windows: `x64` NSIS
             - npm: `@adithyasak/t3@${{ needs.meta.outputs.version }}`
 
-            Install tip: if Gatekeeper blocks the app, right-click the app → Open.
+            macOS: if Gatekeeper blocks the app, right-click → Open.
+            Windows: if SmartScreen warns, choose More info → Run anyway.
 
             After the first install, later personal builds appear as in-app updates
             (this release is a full "latest" so electron-updater can find it).
@@ -363,6 +366,175 @@ jobs:
           files: |
             release-publish/*.dmg
             release-publish/*.zip
+            release-publish/*.blockmap
+            release-publish/*.yml
+          fail_on_unmatched_files: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # node-pty publishes no Linux prebuild; the WSL backend needs a Linux pty.node
+  # shipped inside the Windows installer (same approach as upstream release.yml).
+  build_wsl_node_pty:
+    name: Build WSL node-pty (linux-x64)
+    needs: meta
+    if: github.repository_owner != 'pingdotgg'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=t3...
+
+      - name: Build node-pty linux-x64 prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload node-pty linux-x64 prebuild
+        uses: actions/upload-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+
+  build_windows:
+    name: Build Windows NSIS + publish release
+    needs: [meta, publish_cli, build_wsl_node_pty]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.build_wsl_node_pty.result == 'success' && (needs.publish_cli.result == 'success' || needs.publish_cli.result == 'skipped') }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      T3CODE_CLI_PACKAGE_NAME: "@adithyasak/t3"
+      T3CODE_DESKTOP_PASSKEYS: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Bake production T3 Connect public config
+        shell: bash
+        run: cp .env.example .env
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.meta.outputs.version }}"
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild
+
+      - name: Install Spectre-mitigated MSVC libs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          if (-not $installPath) {
+            Write-Error "Visual Studio installation not found."
+            exit 1
+          }
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      - name: Build unsigned Windows NSIS
+        shell: bash
+        env:
+          T3CODE_DESKTOP_APP_ID: ${{ needs.meta.outputs.app_id }}
+          T3CODE_DESKTOP_PRODUCT_NAME: ${{ needs.meta.outputs.product_name }}
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "${{ needs.meta.outputs.version }}" \
+            --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
+            --verbose
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          copied=0
+          for pattern in \
+            "release/*.exe" \
+            "release/*.blockmap" \
+            "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+              copied=$((copied + 1))
+            done
+          done
+          if [[ "${copied}" -eq 0 ]]; then
+            echo "No desktop artifacts found under release/" >&2
+            ls -la release || true
+            exit 1
+          fi
+          ls -lah release-publish
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.release_name }}
+          body: |
+            Personal unsigned desktop build from `${{ github.sha }}`.
+
+            - Product: `${{ needs.meta.outputs.product_name }}`
+            - Bundle / app id: `${{ needs.meta.outputs.app_id }}`
+            - macOS: `${{ needs.meta.outputs.arch }}` DMG
+            - Windows: `x64` NSIS
+            - npm: `@adithyasak/t3@${{ needs.meta.outputs.version }}`
+
+            macOS: if Gatekeeper blocks the app, right-click → Open.
+            Windows: if SmartScreen warns, choose More info → Run anyway.
+
+            After the first install, later personal builds appear as in-app updates
+            (this release is a full "latest" so electron-updater can find it).
+          prerelease: false
+          make_latest: true
+          files: |
+            release-publish/*.exe
             release-publish/*.blockmap
             release-publish/*.yml
           fail_on_unmatched_files: false

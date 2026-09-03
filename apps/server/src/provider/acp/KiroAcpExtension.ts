@@ -345,9 +345,7 @@ export function kiroVendorChildSessionId(
   if (sessionId && sessionId !== parentSessionId) {
     return sessionId;
   }
-  return (
-    trimmedNonEmpty(notification.toolCallId) ?? trimmedNonEmpty(notification.update?.toolCallId)
-  );
+  return undefined;
 }
 
 export function kiroVendorSessionUpdateTitle(

@@ -136,7 +136,7 @@ describe("KiroAcpExtension", () => {
         },
         "parent-session",
       ),
-    ).toBeUndefined();
+    ).toBe("tool-2");
     expect(kiroVendorSessionUpdateKind({ sessionUpdate: "tool_call_chunk" })).toBe(
       "tool_call_chunk",
     );

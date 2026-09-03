@@ -1657,8 +1657,6 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       yield* touchTurnLiveness(liveCtx, turnId);
                     }
                     const childId = kiroVendorChildSessionId(params, liveCtx.acpSessionId);
-                    // Parent-session tool_call_chunks are ordinary tools.
-                    // Only a distinct child sessionId starts a subagent row.
                     if (!childId) {
                       return;
                     }

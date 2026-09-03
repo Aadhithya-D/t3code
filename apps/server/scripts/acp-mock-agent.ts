@@ -30,11 +30,6 @@ const emitPlanThenHang = process.env.T3_ACP_EMIT_PLAN_THEN_HANG === "1";
 const emitActiveToolThenHang = process.env.T3_ACP_EMIT_ACTIVE_TOOL_THEN_HANG === "1";
 const emitChildSessionThenHang = process.env.T3_ACP_EMIT_CHILD_SESSION_THEN_HANG === "1";
 const emitKiroSubagentThenHang = process.env.T3_ACP_EMIT_KIRO_SUBAGENT_THEN_HANG === "1";
-const emitKiroParentToolChunkThenHang =
-  process.env.T3_ACP_EMIT_KIRO_PARENT_TOOL_CHUNK_THEN_HANG === "1";
-const emitKiroParentToolChunk = process.env.T3_ACP_EMIT_KIRO_PARENT_TOOL_CHUNK === "1";
-const emitKiroChildMetadataThenHang =
-  process.env.T3_ACP_EMIT_KIRO_CHILD_METADATA_THEN_HANG === "1";
 const emitKiroSubagentLifecycle = process.env.T3_ACP_EMIT_KIRO_SUBAGENT_LIFECYCLE === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
@@ -670,71 +665,6 @@ const program = Effect.gen(function* () {
             title: "Child-only tool",
             kind: "read",
           });
-          yield* Effect.sleep("80 millis");
-        }
-      }
-
-      if (emitKiroParentToolChunkThenHang || emitKiroParentToolChunk) {
-        yield* agent.client.sessionUpdate({
-          sessionId: requestedSessionId,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId: "call-parent-glob-1",
-            title: "glob",
-            kind: "search",
-            status: "in_progress",
-            rawInput: {},
-          },
-        });
-        writeJsonRpcNotification("_kiro.dev/session/update", {
-          sessionId: requestedSessionId,
-          update: {
-            sessionUpdate: "tool_call_chunk",
-            toolCallId: "call-parent-glob-1",
-            title: "glob",
-            kind: "search",
-          },
-        });
-        if (emitKiroParentToolChunkThenHang) {
-          while (true) {
-            writeJsonRpcNotification("_kiro.dev/session/update", {
-              sessionId: requestedSessionId,
-              update: {
-                sessionUpdate: "tool_call_chunk",
-                toolCallId: "call-parent-glob-1",
-                title: "glob",
-                kind: "search",
-              },
-            });
-            yield* Effect.sleep("80 millis");
-          }
-        }
-        yield* agent.client.sessionUpdate({
-          sessionId: requestedSessionId,
-          update: {
-            sessionUpdate: "tool_call_update",
-            toolCallId: "call-parent-glob-1",
-            status: "completed",
-          },
-        });
-        yield* agent.client.sessionUpdate({
-          sessionId: requestedSessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "found the files" },
-          },
-        });
-        return { stopReason: "end_turn" };
-      }
-
-      if (emitKiroChildMetadataThenHang) {
-        // Real Kiro crews stay on the parent session and only ping
-        // `_kiro.dev/metadata` / permissions on a child sessionId.
-        writeJsonRpcNotification("_kiro.dev/metadata", {
-          sessionId: "mock-child-session-1",
-          contextUsagePercentage: 12,
-        });
-        while (true) {
           yield* Effect.sleep("80 millis");
         }
       }

@@ -132,7 +132,7 @@ describe("KiroAcpExtension", () => {
           sessionId: "parent-session",
           sessionUpdate: "tool_call_chunk",
           toolCallId: "tool-2",
-          title: "glob",
+          title: "Read file",
         },
         "parent-session",
       ),

@@ -5,6 +5,7 @@ import {
   makeKiroAcpRuntime,
   resolveKiroAcpModelId,
   resolveKiroEffortFromModelSelection,
+  steerKiroAcpTurn,
 } from "../acp/KiroAcpSupport.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { makeGrokAdapter } from "./GrokAdapter.ts";
@@ -17,6 +18,7 @@ export interface KiroAdapterLiveOptions {
   readonly turnInactivityTimeoutMs?: number;
   readonly activeToolInactivityTimeoutMs?: number;
   readonly concurrentPromptRetryDelaysMs?: ReadonlyArray<number>;
+  readonly postPromptQuietPeriodMs?: number;
 }
 
 /**
@@ -27,8 +29,9 @@ export interface KiroAdapterLiveOptions {
  * Effort is a Kiro-only trait: spawn with `--effort` on session start, and
  * apply mid-session changes via `/effort` when the composer toggle changes.
  *
- * Kiro rejects concurrent `session/prompt` calls, so a follow-up message
- * cancels the live turn instead of Grok-style steering.
+ * Kiro rejects concurrent `session/prompt` calls, but exposes `_session/steer`
+ * for queuing plain-text follow-ups into the live prompt. Attachments and
+ * failed extension requests retain the cancel-then-prompt fallback.
  */
 export function makeKiroAdapter(kiroSettings: KiroSettings, options?: KiroAdapterLiveOptions) {
   return makeGrokAdapter(kiroSettings, {
@@ -36,6 +39,11 @@ export function makeKiroAdapter(kiroSettings: KiroSettings, options?: KiroAdapte
     provider: ProviderDriverKind.make("kiro"),
     providerDisplayName: "Kiro",
     steerInFlightTurns: false,
+    steerInFlightTurn: steerKiroAcpTurn,
+    // Kiro can resolve session/prompt just before its final content updates.
+    // Keep the turn open through a short quiet window so those updates are
+    // projected instead of being dropped as late events.
+    postPromptQuietPeriodMs: options?.postPromptQuietPeriodMs ?? 750,
     resolveModelId: resolveKiroAcpModelId,
     resolveSessionEffort: resolveKiroEffortFromModelSelection,
     applySessionEffort: ({ runtime, effort }) =>

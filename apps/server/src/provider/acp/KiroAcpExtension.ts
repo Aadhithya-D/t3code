@@ -191,12 +191,25 @@ const KiroSubagentListEntry = Schema.Struct({
   sessionId: Schema.optionalKey(Schema.String),
   agentId: Schema.optionalKey(Schema.String),
   subagentId: Schema.optionalKey(Schema.String),
-  status: Schema.optionalKey(Schema.String),
+  status: Schema.optionalKey(
+    Schema.Union([
+      Schema.String,
+      Schema.Struct({
+        type: Schema.String,
+        message: Schema.optionalKey(Schema.String),
+      }),
+    ]),
+  ),
   title: Schema.optionalKey(Schema.String),
   name: Schema.optionalKey(Schema.String),
+  sessionName: Schema.optionalKey(Schema.String),
+  agentName: Schema.optionalKey(Schema.String),
   role: Schema.optionalKey(Schema.String),
   description: Schema.optionalKey(Schema.String),
   lastToolName: Schema.optionalKey(Schema.String),
+  parentSessionId: Schema.optionalKey(Schema.String),
+  group: Schema.optionalKey(Schema.String),
+  dependsOn: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 export type KiroSubagentListEntry = typeof KiroSubagentListEntry.Type;
 
@@ -204,6 +217,7 @@ export const KiroSubagentListUpdateNotification = Schema.Struct({
   sessionId: Schema.optionalKey(Schema.String),
   agents: Schema.optionalKey(Schema.Array(KiroSubagentListEntry)),
   subagents: Schema.optionalKey(Schema.Array(KiroSubagentListEntry)),
+  pendingStages: Schema.optionalKey(Schema.Array(Schema.Unknown)),
 });
 export type KiroSubagentListUpdateNotification = typeof KiroSubagentListUpdateNotification.Type;
 
@@ -304,11 +318,9 @@ export function isAcpSubagentSpawnTool(toolCall: {
 export function kiroSubagentIdFromToolCall(toolCall: {
   readonly toolCallId: string;
   readonly data: Record<string, unknown>;
-}): string {
+}): string | undefined {
   return (
-    kiroSubagentIdFromRecord(toolCall.data) ??
-    kiroSubagentIdFromRecord(toolCall.data.rawInput) ??
-    toolCall.toolCallId
+    kiroSubagentIdFromRecord(toolCall.data) ?? kiroSubagentIdFromRecord(toolCall.data.rawInput)
   );
 }
 
@@ -320,6 +332,21 @@ export function kiroSubagentEntriesFromListUpdate(
 
 export function kiroSubagentEntryId(entry: KiroSubagentListEntry): string | undefined {
   return kiroSubagentIdFromRecord(entry);
+}
+
+export function kiroSubagentEntryStatus(entry: KiroSubagentListEntry): string | undefined {
+  return typeof entry.status === "string" ? entry.status : entry.status?.type;
+}
+
+export function kiroSubagentEntryTitle(entry: KiroSubagentListEntry): string | undefined {
+  return (
+    trimmedNonEmpty(entry.sessionName) ??
+    trimmedNonEmpty(entry.title) ??
+    trimmedNonEmpty(entry.name) ??
+    trimmedNonEmpty(entry.agentName) ??
+    trimmedNonEmpty(entry.description) ??
+    trimmedNonEmpty(entry.role)
+  );
 }
 
 const TERMINAL_SUBAGENT_STATUS_RE = /^(completed|failed|cancelled|stopped|terminated|done)$/i;

@@ -10,6 +10,8 @@ import {
   isRetryableBusySessionPromptError,
   kiroSubagentEntriesFromListUpdate,
   kiroSubagentEntryId,
+  kiroSubagentEntryStatus,
+  kiroSubagentEntryTitle,
   kiroSubagentIdFromToolCall,
   kiroVendorChildSessionId,
   kiroVendorSessionUpdateKind,
@@ -152,14 +154,21 @@ describe("KiroAcpExtension", () => {
   it("reads Kiro subagent roster updates", () => {
     const entries = kiroSubagentEntriesFromListUpdate({
       sessionId: "parent-1",
-      agents: [
-        { sessionId: "child-1", status: "running", title: "Explorer" },
-        { sessionId: "child-2", status: "completed" },
+      subagents: [
+        {
+          sessionId: "child-1",
+          status: { type: "working", message: "Running" },
+          sessionName: "Explorer",
+          agentName: "kiro_default",
+        },
+        { sessionId: "child-2", status: { type: "terminated" } },
       ],
+      pendingStages: [],
     });
     expect(entries.map((entry) => kiroSubagentEntryId(entry))).toEqual(["child-1", "child-2"]);
-    expect(isKiroSubagentTerminalStatus("running")).toBe(false);
-    expect(isKiroSubagentTerminalStatus("completed")).toBe(true);
-    expect(isKiroSubagentTerminalStatus("terminated")).toBe(true);
+    expect(kiroSubagentEntryStatus(entries[0]!)).toBe("working");
+    expect(kiroSubagentEntryTitle(entries[0]!)).toBe("Explorer");
+    expect(isKiroSubagentTerminalStatus(kiroSubagentEntryStatus(entries[0]!))).toBe(false);
+    expect(isKiroSubagentTerminalStatus(kiroSubagentEntryStatus(entries[1]!))).toBe(true);
   });
 });

@@ -1,10 +1,12 @@
-import { describe, expect, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 
 import {
   buildKiroAcpSpawnInput,
   normalizeKiroEffort,
   resolveKiroAcpModelId,
   resolveKiroEffortFromModelSelection,
+  steerKiroAcpTurn,
 } from "./KiroAcpSupport.ts";
 
 describe("buildKiroAcpSpawnInput", () => {
@@ -41,6 +43,44 @@ describe("buildKiroAcpSpawnInput", () => {
     });
   });
 });
+
+it.effect("wraps in-flight Kiro steering in the documented ACP extension", () =>
+  Effect.gen(function* () {
+    let observed: { method: string; payload: unknown } | undefined;
+    yield* steerKiroAcpTurn({
+      runtime: {
+        request: (method, payload) =>
+          Effect.sync(() => {
+            observed = { method, payload };
+            return { queued: true };
+          }),
+      },
+      sessionId: "session-1",
+      text: " focus on cancellation ",
+    });
+
+    assert.deepEqual(observed, {
+      method: "_session/steer",
+      payload: {
+        sessionId: "session-1",
+        message: "<user_message>\nfocus on cancellation\n</user_message>",
+      },
+    });
+  }),
+);
+
+it.effect("rejects steering that Kiro did not acknowledge as queued", () =>
+  Effect.gen(function* () {
+    for (const response of [{ queued: false }, {}, null]) {
+      const result = yield* steerKiroAcpTurn({
+        runtime: { request: () => Effect.succeed(response) },
+        sessionId: "session-1",
+        text: "continue",
+      }).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+    }
+  }),
+);
 
 describe("resolveKiroAcpModelId", () => {
   it("keeps the selectable default slug and normalizes explicit model ids", () => {

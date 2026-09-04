@@ -96,7 +96,7 @@ it.layer(testLayer)("KiroAdapter", (it) => {
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("stops an in-flight message and accepts a follow-up", () =>
@@ -151,19 +151,24 @@ it.layer(testLayer)("KiroAdapter", (it) => {
     }).pipe(TestClock.withLive),
   );
 
-  it.effect("cancels an in-flight Kiro turn when a follow-up message arrives", () =>
+  it.effect("steers an in-flight Kiro turn through the Kiro ACP extension", () =>
     Effect.gen(function* () {
-      const threadId = ThreadId.make("kiro-follow-up-cancels-live-turn");
+      const threadId = ThreadId.make("kiro-follow-up-steers-live-turn");
+      const dir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kiro-acp-steer-")),
+      );
+      const requestLogPath = NodePath.join(dir, "requests.ndjson");
       const binaryPath = yield* Effect.promise(() =>
-        makeMockKiroWrapper({ T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1" }),
+        makeMockKiroWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
       );
       const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
-        concurrentPromptRetryDelaysMs: [0, 50],
+        postPromptQuietPeriodMs: 25,
       });
       const events: ProviderRuntimeEvent[] = [];
       const firstTurnStarted = yield* Deferred.make<string>();
-      const twoTurnsCompleted = yield* Deferred.make<void>();
-      const completedCountRef = { current: 0 };
       const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
         Effect.gen(function* () {
           if (String(event.threadId) !== String(threadId)) {
@@ -172,12 +177,6 @@ it.layer(testLayer)("KiroAdapter", (it) => {
           events.push(event);
           if (event.type === "turn.started" && event.turnId !== undefined) {
             yield* Deferred.succeed(firstTurnStarted, String(event.turnId)).pipe(Effect.ignore);
-          }
-          if (event.type === "turn.completed") {
-            completedCountRef.current += 1;
-            if (completedCountRef.current === 2) {
-              yield* Deferred.succeed(twoTurnsCompleted, undefined).pipe(Effect.ignore);
-            }
           }
         }),
       ).pipe(Effect.forkChild);
@@ -197,20 +196,25 @@ it.layer(testLayer)("KiroAdapter", (it) => {
         input: "new instructions",
         attachments: [],
       });
+      assert.equal(String(followUp.turnId), firstTurnId);
+      assert.lengthOf(
+        events.filter((event) => event.type === "turn.completed"),
+        0,
+      );
+      const requests = yield* waitForFileContent(requestLogPath);
+      assert.include(requests, '"method":"_session/steer"');
+      assert.include(requests, "new instructions");
+
+      yield* adapter.interruptTurn(threadId);
       yield* Fiber.join(firstTurn);
-      yield* Deferred.await(twoTurnsCompleted);
 
       const completed = events.filter(
         (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
           event.type === "turn.completed",
       );
-      assert.notEqual(String(followUp.turnId), firstTurnId);
       assert.deepEqual(
         completed.map((event) => [String(event.turnId), event.payload.state]),
-        [
-          [firstTurnId, "cancelled"],
-          [String(followUp.turnId), "completed"],
-        ],
+        [[firstTurnId, "cancelled"]],
       );
       const session = (yield* adapter.listSessions()).find(
         (candidate) => candidate.threadId === threadId,
@@ -223,11 +227,53 @@ it.layer(testLayer)("KiroAdapter", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("keeps late Kiro content that arrives after the prompt response", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-late-content-after-response");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_EMIT_KIRO_LATE_CONTENT_AFTER_PROMPT_RESPONSE: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
+        postPromptQuietPeriodMs: 75,
+      });
+      const events: ProviderRuntimeEvent[] = [];
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "reply later", attachments: [] });
+
+      assert.equal(
+        events.find((event) => event.type === "content.delta")?.payload.delta,
+        "late Kiro content",
+      );
+      assert.isFalse(events.some((event) => event.type === "runtime.warning"));
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "turn.completed")
+          .map((event) => event.payload.state),
+        ["completed"],
+      );
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("accepts a Kiro follow-up after Stop while the previous prompt is still hanging", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("kiro-stop-then-follow-up");
       const binaryPath = yield* Effect.promise(() =>
-        makeMockKiroWrapper({ T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1" }),
+        makeMockKiroWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_BUSY_PROMPT_FAILURES_AFTER_FIRST_CANCEL: "2",
+        }),
       );
       const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
         concurrentPromptRetryDelaysMs: [0, 50],
@@ -242,7 +288,11 @@ it.layer(testLayer)("KiroAdapter", (it) => {
             return;
           }
           events.push(event);
-          if (event.type === "turn.started" && event.turnId !== undefined) {
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "mock first prompt running" &&
+            event.turnId !== undefined
+          ) {
             yield* Deferred.succeed(firstTurnStarted, String(event.turnId)).pipe(Effect.ignore);
           }
           if (event.type === "turn.completed") {
@@ -291,6 +341,69 @@ it.layer(testLayer)("KiroAdapter", (it) => {
       assert.equal(session?.status, "ready");
       assert.isUndefined(session?.activeTurnId);
 
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("does not resubmit a cancelled prompt after busy retry backoff", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-stop-during-retry");
+      const dir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "kiro-retry-stop-")),
+      );
+      const requestLogPath = NodePath.join(dir, "requests.log");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_BUSY_PROMPT_FAILURES_AFTER_FIRST_CANCEL: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }), {
+        concurrentPromptRetryDelaysMs: [100],
+      });
+      const started = yield* Deferred.make<void>();
+      const busy = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (event.threadId !== threadId) return;
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "mock first prompt running"
+          ) {
+            yield* Deferred.succeed(started, undefined);
+          }
+          if (event.type === "content.delta" && event.payload.delta === "mock busy rejection") {
+            yield* Deferred.succeed(busy, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const first = yield* adapter.sendTurn({ threadId, input: "first" }).pipe(Effect.forkChild);
+      yield* Deferred.await(started);
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(first);
+      const retrying = yield* adapter
+        .sendTurn({ threadId, input: "retry me" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(busy);
+      yield* adapter.interruptTurn(threadId);
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(retrying);
+      const requests = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      const prompts = requests
+        .split("\n")
+        .filter((line) => line.includes('"method":"session/prompt"'));
+      assert.lengthOf(prompts, 2);
+      yield* adapter.sendTurn({ threadId, input: "fresh message" });
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.equal(session?.status, "ready");
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
@@ -434,6 +547,14 @@ it.layer(testLayer)("KiroAdapter", (it) => {
             event.type === "task.completed") &&
           event.payload.taskId === "mock-child-session-1",
       );
+      assert.lengthOf(
+        childTasks.filter((event) => event.type === "task.started"),
+        1,
+      );
+      assert.lengthOf(
+        childTasks.filter((event) => event.type === "task.completed"),
+        1,
+      );
       const started = events.find((event) => event.type === "task.started");
       assert.equal(started?.type, "task.started");
       if (started?.type === "task.started") {
@@ -457,6 +578,12 @@ it.layer(testLayer)("KiroAdapter", (it) => {
       assert.isTrue(
         childTasks.some(
           (event) => event.type === "task.completed" && event.payload.status === "completed",
+        ),
+      );
+      assert.isFalse(
+        events.some(
+          (event) =>
+            event.type === "task.started" && event.payload.taskId === "parent-subagent-tool",
         ),
       );
       assert.isTrue(

@@ -97,6 +97,8 @@ import {
   KIRO_SESSION_TERMINATE_METHOD,
   kiroSubagentEntriesFromListUpdate,
   kiroSubagentEntryId,
+  kiroSubagentEntryStatus,
+  kiroSubagentEntryTitle,
   kiroSubagentIdFromToolCall,
   kiroVendorChildSessionId,
   kiroVendorSessionUpdateKind,
@@ -197,6 +199,14 @@ export interface GrokAdapterLiveOptions {
    * cancels the live turn and starts a new one instead.
    */
   readonly steerInFlightTurns?: boolean;
+  /** Provider extension used to fold a text-only follow-up into a live turn. */
+  readonly steerInFlightTurn?: (input: {
+    readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "request">;
+    readonly sessionId: string;
+    readonly text: string;
+  }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  /** Keep a prompt live until ACP activity has been quiet for this duration. */
+  readonly postPromptQuietPeriodMs?: number;
 }
 
 interface PendingApproval {
@@ -242,6 +252,7 @@ interface GrokSessionContext {
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
   readonly livenessSignals: Queue.Queue<GrokTurnLivenessSignal>;
+  readonly postPromptActivitySignals: Queue.Queue<GrokTurnLivenessSignal>;
   livenessTurnId: TurnId | undefined;
   lastTurnActivityAtNanos: bigint | undefined;
   readonly activeToolCallIds: Set<string>;
@@ -253,6 +264,7 @@ interface GrokSessionContext {
   readonly activeChildSessionIds: Set<string>;
   /** Child sessions that already got a `task.started` so we do not double-emit. */
   readonly startedChildSessionIds: Set<string>;
+  readonly completedChildSessionIds: Set<string>;
   livenessUpdatesInFlight: number;
   /** Prompt RPCs that returned before their turn settlement acquired the lock. */
   promptResponsesReady: number;
@@ -503,6 +515,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       options?.concurrentPromptRetryDelaysMs,
     );
     const steerInFlightTurns = options?.steerInFlightTurns !== false;
+    const steerInFlightTurn = options?.steerInFlightTurn;
+    const postPromptQuietPeriodMs =
+      options?.postPromptQuietPeriodMs !== undefined &&
+      Number.isFinite(options.postPromptQuietPeriodMs) &&
+      options.postPromptQuietPeriodMs > 0
+        ? Math.floor(options.postPromptQuietPeriodMs)
+        : undefined;
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -554,7 +573,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
 
     const signalTurnLiveness = (ctx: GrokSessionContext, turnId: TurnId) =>
-      Queue.offer(ctx.livenessSignals, { turnId }).pipe(Effect.asVoid);
+      Effect.all(
+        [
+          Queue.offer(ctx.livenessSignals, { turnId }),
+          Queue.offer(ctx.postPromptActivitySignals, { turnId }),
+        ],
+        { discard: true },
+      );
 
     const beginTurnLiveness = (ctx: GrokSessionContext, turnId: TurnId) =>
       Effect.sync(() => {
@@ -564,6 +589,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         ctx.lastTurnActivityAtNanos = undefined;
         ctx.activeToolCallIds.clear();
         ctx.activeChildSessionIds.clear();
+        ctx.completedChildSessionIds.clear();
       });
 
     const clearTurnLiveness = (ctx: GrokSessionContext) => {
@@ -665,16 +691,63 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       yield* signalTurnLiveness(ctx, turnId);
     });
 
+    const waitForPostPromptQuiet = Effect.fn("GrokAdapter.waitForPostPromptQuiet")(function* (
+      threadId: ThreadId,
+      expectedAcpSessionId: string,
+      turnId: TurnId,
+      quietPeriodMs: number,
+    ) {
+      while (true) {
+        const ctx = sessions.get(threadId);
+        if (
+          !ctx ||
+          ctx.stopped ||
+          ctx.acpSessionId !== expectedAcpSessionId ||
+          ctx.activeTurnId !== turnId ||
+          ctx.interruptedTurnIds.has(turnId)
+        ) {
+          return;
+        }
+        if (ctx.activeChildSessionIds.size > 0 || ctx.activeToolCallIds.size > 0) {
+          yield* Queue.take(ctx.postPromptActivitySignals);
+          continue;
+        }
+        const activityAtStart = ctx.lastTurnActivityAtNanos;
+        const outcome = yield* Effect.raceFirst(
+          Queue.take(ctx.postPromptActivitySignals).pipe(Effect.as("activity" as const)),
+          Effect.sleep(Duration.millis(quietPeriodMs)).pipe(Effect.as("quiet" as const)),
+        );
+        if (outcome === "activity") {
+          continue;
+        }
+        const liveCtx = sessions.get(threadId);
+        if (
+          liveCtx?.acpSessionId === expectedAcpSessionId &&
+          liveCtx.activeTurnId === turnId &&
+          !liveCtx.interruptedTurnIds.has(turnId) &&
+          liveCtx.activeChildSessionIds.size === 0 &&
+          liveCtx.activeToolCallIds.size === 0 &&
+          liveCtx.lastTurnActivityAtNanos === activityAtStart
+        ) {
+          return;
+        }
+      }
+    });
+
     const completeChildAgent = Effect.fn("GrokAdapter.completeChildAgent")(function* (
       ctx: GrokSessionContext,
       childSessionId: string,
       status: "completed" | "failed" | "stopped",
     ) {
       ctx.activeChildSessionIds.delete(childSessionId);
+      ctx.completedChildSessionIds.add(childSessionId);
+      const turnId = resolveNotificationTurnId(ctx);
+      if (turnId !== undefined) {
+        yield* signalTurnLiveness(ctx, turnId);
+      }
       if (!ctx.startedChildSessionIds.delete(childSessionId)) {
         return;
       }
-      const turnId = resolveNotificationTurnId(ctx);
       yield* offerRuntimeEvent({
         type: "task.completed",
         ...(yield* makeEventStamp()),
@@ -696,8 +769,16 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       childSessionId: string,
       options?: { readonly title?: string; readonly role?: string; readonly toolUseId?: string },
     ) {
-      ctx.activeChildSessionIds.add(childSessionId);
       const turnId = resolveNotificationTurnId(ctx);
+      if (
+        ctx.stopped ||
+        turnId === undefined ||
+        ctx.interruptedTurnIds.has(turnId) ||
+        ctx.completedChildSessionIds.has(childSessionId)
+      ) {
+        return;
+      }
+      ctx.activeChildSessionIds.add(childSessionId);
       if (turnId !== undefined) {
         yield* touchTurnLiveness(ctx, turnId);
       }
@@ -742,6 +823,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       },
     ) {
       const turnId = resolveNotificationTurnId(ctx);
+      if (
+        ctx.stopped ||
+        turnId === undefined ||
+        ctx.interruptedTurnIds.has(turnId) ||
+        ctx.completedChildSessionIds.has(childSessionId)
+      ) {
+        return;
+      }
       yield* offerRuntimeEvent({
         type: "task.progress",
         ...(yield* makeEventStamp()),
@@ -766,6 +855,15 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       childSessionId: string,
       event: AcpParsedSessionEvent | undefined,
     ) {
+      const turnId = resolveNotificationTurnId(ctx);
+      if (
+        ctx.stopped ||
+        turnId === undefined ||
+        ctx.interruptedTurnIds.has(turnId) ||
+        ctx.completedChildSessionIds.has(childSessionId)
+      ) {
+        return;
+      }
       yield* ensureChildAgentStarted(ctx, childSessionId);
       if (!event) {
         return;
@@ -784,9 +882,12 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               agentId: childSessionId,
             }),
           );
-          yield* emitChildAgentProgress(ctx, childSessionId, event.toolCall.title ?? "Tool", {
-            lastToolName: event.toolCall.title,
-          });
+          yield* emitChildAgentProgress(
+            ctx,
+            childSessionId,
+            event.toolCall.title ?? "Tool",
+            event.toolCall.title === undefined ? {} : { lastToolName: event.toolCall.title },
+          );
           return;
         }
         case "ContentDelta": {
@@ -1542,7 +1643,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       // Child crews often only ping metadata on their own
                       // sessionId. Track them for the longer idle deadline
                       // without opening an Agents-panel row.
-                      if (params.sessionId && params.sessionId !== liveCtx.acpSessionId) {
+                      if (
+                        params.sessionId &&
+                        params.sessionId !== liveCtx.acpSessionId &&
+                        !liveCtx.completedChildSessionIds.has(params.sessionId)
+                      ) {
                         liveCtx.activeChildSessionIds.add(params.sessionId);
                       }
                       // Thinking, subagents, and credit pings do not emit ACP
@@ -1577,6 +1682,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapAcpCallbackFailure(
                   Effect.gen(function* () {
                     yield* logNative(input.threadId, KIRO_DEV_SUBAGENT_LIST_UPDATE_METHOD, params);
+                    // Standard child updates are queued separately from vendor
+                    // callbacks. Project preceding output before marking the
+                    // child terminal, otherwise its final tools can be lost.
+                    yield* acp.drainEvents;
                     const liveCtx = sessions.get(input.threadId);
                     if (!liveCtx) {
                       return;
@@ -1585,18 +1694,21 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     if (turnId !== undefined) {
                       yield* touchTurnLiveness(liveCtx, turnId);
                     }
-                    for (const entry of kiroSubagentEntriesFromListUpdate(params)) {
+                    const entries = kiroSubagentEntriesFromListUpdate(params);
+                    const reportedChildIds = new Set<string>();
+                    for (const entry of entries) {
                       const childId = kiroSubagentEntryId(entry);
                       if (!childId) {
                         continue;
                       }
-                      const title =
-                        entry.title?.trim() || entry.name?.trim() || entry.description?.trim();
-                      if (isKiroSubagentTerminalStatus(entry.status)) {
+                      reportedChildIds.add(childId);
+                      const title = kiroSubagentEntryTitle(entry);
+                      const status = kiroSubagentEntryStatus(entry);
+                      if (isKiroSubagentTerminalStatus(status)) {
                         yield* completeChildAgent(
                           liveCtx,
                           childId,
-                          entry.status?.toLowerCase() === "failed" ? "failed" : "completed",
+                          status?.toLowerCase() === "failed" ? "failed" : "completed",
                         );
                         continue;
                       }
@@ -1619,6 +1731,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         );
                       }
                     }
+                    // Kiro sends a complete roster snapshot. A child omitted
+                    // from the next snapshot has finished even when no
+                    // explicit `terminated` entry was observed.
+                    for (const childId of liveCtx.activeChildSessionIds) {
+                      if (!reportedChildIds.has(childId)) {
+                        yield* completeChildAgent(liveCtx, childId, "completed");
+                      }
+                    }
                   }),
                 ),
             );
@@ -1629,6 +1749,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapAcpCallbackFailure(
                   Effect.gen(function* () {
                     yield* logNative(input.threadId, KIRO_SESSION_TERMINATE_METHOD, params);
+                    yield* acp.drainEvents;
                     const liveCtx = sessions.get(input.threadId);
                     if (!liveCtx) {
                       return;
@@ -1662,13 +1783,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     }
                     const title = kiroVendorSessionUpdateTitle(params);
                     const kind = kiroVendorSessionUpdateKind(params);
-                    yield* ensureChildAgentStarted(liveCtx, childId, {
-                      ...(title ? { title } : {}),
-                    });
+                    yield* ensureChildAgentStarted(liveCtx, childId, title ? { title } : {});
                     if (kind === "tool_call_chunk" || title) {
-                      yield* emitChildAgentProgress(liveCtx, childId, title ?? "Working", {
-                        ...(title ? { lastToolName: title } : {}),
-                      });
+                      yield* emitChildAgentProgress(
+                        liveCtx,
+                        childId,
+                        title ?? "Working",
+                        title ? { lastToolName: title } : {},
+                      );
                     }
                   }),
                 ),
@@ -1957,11 +2079,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             interruptedTurnIds: new Set(),
             promptsInFlight: 0,
             livenessSignals: yield* Queue.sliding<GrokTurnLivenessSignal>(1),
+            postPromptActivitySignals: yield* Queue.sliding<GrokTurnLivenessSignal>(1),
             livenessTurnId: undefined,
             lastTurnActivityAtNanos: undefined,
             activeToolCallIds: new Set(),
             activeChildSessionIds: new Set(),
             startedChildSessionIds: new Set(),
+            completedChildSessionIds: new Set(),
             livenessUpdatesInFlight: 0,
             promptResponsesReady: 0,
             acpPromptMayStillBeActive: false,
@@ -1986,7 +2110,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 if (event._tag === "ChildSessionEvent") {
                   yield* logNative(ctx.threadId, "session/update", event.event ?? event);
                   const childTurnId = resolveNotificationTurnId(ctx);
-                  if (childTurnId !== undefined) {
+                  if (
+                    childTurnId !== undefined &&
+                    !ctx.interruptedTurnIds.has(childTurnId) &&
+                    !ctx.completedChildSessionIds.has(event.sessionId)
+                  ) {
                     ctx.activeChildSessionIds.add(event.sessionId);
                     yield* touchTurnLiveness(ctx, childTurnId);
                   }
@@ -2082,10 +2210,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       // The spawn tool completing only means Kiro accepted the
                       // launch. The child keeps running until terminate / list
                       // update, so do not complete the task here.
-                      yield* ensureChildAgentStarted(ctx, childId, {
-                        title: event.toolCall.title,
-                        toolUseId: event.toolCall.toolCallId,
-                      });
+                      if (childId !== undefined) {
+                        yield* ensureChildAgentStarted(ctx, childId, {
+                          ...(event.toolCall.title === undefined
+                            ? {}
+                            : { title: event.toolCall.title }),
+                          toolUseId: event.toolCall.toolCallId,
+                        });
+                      }
                     }
                     ctx.planModeActive = nextGrokPlanModeActive(ctx.planModeActive, event.toolCall);
                     // Only promote session plan.md writes while plan mode is
@@ -2175,6 +2307,46 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     const sendTurn: GrokAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
+        const steeredTurn = yield* withThreadLock(
+          input.threadId,
+          Effect.gen(function* () {
+            const ctx = yield* requireSession(input.threadId);
+            const text = input.input?.trim();
+            const activeTurnId = ctx.activeTurnId;
+            if (
+              !steerInFlightTurn ||
+              !text ||
+              (input.attachments?.length ?? 0) > 0 ||
+              ctx.promptsInFlight <= 0 ||
+              activeTurnId === undefined ||
+              ctx.interruptedTurnIds.has(activeTurnId)
+            ) {
+              return undefined;
+            }
+            return yield* steerInFlightTurn({
+              runtime: ctx.acp,
+              sessionId: ctx.acpSessionId,
+              text,
+            }).pipe(
+              Effect.tap(() => refreshSessionTurnLiveness(input.threadId, activeTurnId)),
+              Effect.as({
+                threadId: input.threadId,
+                turnId: activeTurnId,
+                resumeCursor: ctx.session.resumeCursor,
+              }),
+              Effect.catch((cause) =>
+                Effect.logWarning(
+                  `${providerDisplayName} rejected in-flight steering; starting a fresh turn.`,
+                  { cause },
+                ).pipe(Effect.as(undefined)),
+              ),
+            );
+          }),
+        );
+        if (steeredTurn !== undefined) {
+          return steeredTurn;
+        }
+
         const prepared = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
@@ -2393,10 +2565,22 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
            * backing off until the ghost turn drains; Kiro often reports that
            * as JSON-RPC `Internal error` with the real reason in `error.data`.
            */
+          const isPreparedTurnLive = () => {
+            const ctx = sessions.get(input.threadId);
+            return (
+              ctx !== undefined &&
+              !ctx.stopped &&
+              ctx.acpSessionId === prepared.acpSessionId &&
+              ctx.activeTurnId === prepared.turnId &&
+              !ctx.interruptedTurnIds.has(prepared.turnId)
+            );
+          };
           const promptOnce = () =>
-            prepared.acp.prompt({
-              prompt: prepared.promptParts,
-            });
+            Effect.suspend(() =>
+              isPreparedTurnLive()
+                ? prepared.acp.prompt({ prompt: prepared.promptParts })
+                : Effect.succeed({ stopReason: "cancelled" as const }),
+            );
           const shouldRetryBusyPrompt = (error: EffectAcpErrors.AcpError) => {
             const mapped = mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error);
             const recentlyCancelled =
@@ -2414,6 +2598,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               return Effect.gen(function* () {
                 let lastError = error;
                 for (const delayMs of concurrentPromptRetryDelaysMs) {
+                  // Stop may arrive during backoff. A superseded retry must
+                  // neither cancel the new turn nor submit its old prompt.
+                  if (!isPreparedTurnLive()) {
+                    return { stopReason: "cancelled" as const };
+                  }
                   yield* prepared.acp.cancel.pipe(Effect.ignore);
                   if (delayMs > 0) {
                     yield* Effect.sleep(Duration.millis(delayMs));
@@ -2442,11 +2631,20 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   Ref.set(promptResultRef, promptResult),
                   Effect.sync(() => {
                     const liveCtx = sessions.get(input.threadId);
-                    if (liveCtx) {
+                    // The cancelled prompt's RPC can resolve before Kiro has
+                    // actually released the session. Do not let that stale
+                    // response clear the busy-retry guard for the next turn.
+                    if (liveCtx && isPreparedTurnLive()) {
                       liveCtx.acpPromptMayStillBeActive = false;
                     }
                   }),
-                  markPromptResponseReady(input.threadId, prepared.acpSessionId, prepared.turnId),
+                  postPromptQuietPeriodMs === undefined
+                    ? markPromptResponseReady(
+                        input.threadId,
+                        prepared.acpSessionId,
+                        prepared.turnId,
+                      )
+                    : Effect.void,
                 ],
                 { discard: true },
               ),
@@ -2461,6 +2659,20 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
             ),
           );
+
+          if (postPromptQuietPeriodMs !== undefined) {
+            // Kiro may put the JSON-RPC prompt response on stdout immediately
+            // before its last content and metadata notifications. Drain what
+            // is already queued, then keep the turn live until the stream is
+            // genuinely quiet (and all reported child sessions have ended).
+            yield* prepared.acp.drainEvents;
+            yield* waitForPostPromptQuiet(
+              input.threadId,
+              prepared.acpSessionId,
+              prepared.turnId,
+              postPromptQuietPeriodMs,
+            );
+          }
 
           return yield* withThreadLock(
             input.threadId,

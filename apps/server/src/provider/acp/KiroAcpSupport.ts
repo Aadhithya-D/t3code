@@ -10,7 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
-import type * as EffectAcpErrors from "effect-acp/errors";
+import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
@@ -46,6 +46,8 @@ interface KiroAcpRuntimeInput extends Omit<
   /** Initial thinking effort for `kiro-cli acp --effort`. */
   readonly initialEffort?: string | null | undefined;
 }
+
+export const KIRO_SESSION_STEER_METHOD = "_session/steer";
 
 export function normalizeKiroEffort(value: string | null | undefined): KiroEffortLevel | undefined {
   const normalized = value?.trim().toLowerCase();
@@ -134,6 +136,51 @@ export const makeKiroAcpRuntime = (
       Effect.provide(acpContext),
     );
   });
+
+/**
+ * Fold a plain-text follow-up into Kiro's active generation.
+ *
+ * Kiro rejects a second `session/prompt` while a turn is running. Its ACP
+ * extension queues this message at the next model boundary and keeps the
+ * original prompt RPC as the single owner of the turn.
+ */
+export function steerKiroAcpTurn(input: {
+  readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "request">;
+  readonly sessionId: string;
+  readonly text: string;
+}): Effect.Effect<void, EffectAcpErrors.AcpError> {
+  const text = input.text.trim();
+  if (!text) {
+    return Effect.void;
+  }
+  return input.runtime
+    .request(KIRO_SESSION_STEER_METHOD, {
+      sessionId: input.sessionId,
+      message: `<user_message>\n${text}\n</user_message>`,
+    })
+    .pipe(
+      // This request runs under the thread lock. Bound the acknowledgement
+      // wait so an unresponsive extension cannot also block Stop.
+      Effect.timeout(Duration.seconds(10)),
+      Effect.catchTag("TimeoutError", () =>
+        Effect.fail(
+          EffectAcpErrors.AcpRequestError.internalError("Kiro steering acknowledgement timed out"),
+        ),
+      ),
+      Effect.flatMap((response) =>
+        typeof response === "object" &&
+        response !== null &&
+        "queued" in response &&
+        response.queued === true
+          ? Effect.void
+          : Effect.fail(
+              EffectAcpErrors.AcpRequestError.internalError(
+                "Kiro did not queue the steering message",
+              ),
+            ),
+      ),
+    );
+}
 
 /**
  * Apply a mid-session effort change via Kiro's `/effort` slash command.

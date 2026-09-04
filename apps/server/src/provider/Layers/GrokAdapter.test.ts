@@ -513,7 +513,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.isAtLeast(terminalIndex, 0);
       assert.deepEqual(outputAfterTerminal, []);
       assert.notInclude(unattributedToolTitles, "Child-only tool");
-      assert.include(childAgentIds, "mock-child-session-1");
+      assert.include(childAgentIds.map(String), "mock-child-session-1");
       assert.include(attributedChildTitles, "Child-only tool");
       assert.equal(turnCompletedEvent?.payload.stopReason, "end_turn");
       assert.equal(readySession?.status, "ready");

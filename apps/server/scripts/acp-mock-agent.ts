@@ -3,6 +3,7 @@
 import * as NodeFS from "node:fs";
 
 import * as Effect from "effect/Effect";
+import * as Scope from "effect/Scope";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
@@ -36,6 +37,8 @@ const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitEmptyCompletion = process.env.T3_ACP_EMIT_EMPTY_COMPLETION === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
+const emitKiroLateContentAfterPromptResponse =
+  process.env.T3_ACP_EMIT_KIRO_LATE_CONTENT_AFTER_PROMPT_RESPONSE === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
@@ -54,6 +57,9 @@ const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const busyPromptFailuresAfterFirstCancel = Number(
+  process.env.T3_ACP_BUSY_PROMPT_FAILURES_AFTER_FIRST_CANCEL ?? "0",
+);
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -73,6 +79,7 @@ let currentReasoning = "medium";
 let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
+let busyPromptFailuresRemaining = 0;
 let overlappingFirstPromptId: string | undefined;
 /** Session id → promptCount that was in flight when cancel arrived. */
 const cancelledSessions = new Map<string, number>();
@@ -321,6 +328,7 @@ function modelState(): AcpSchema.SessionModelState {
 
 const program = Effect.gen(function* () {
   const agent = yield* EffectAcpAgent.AcpAgent;
+  const programScope = yield* Scope.Scope;
 
   yield* agent.handleInitialize((request) =>
     Effect.sync(() => {
@@ -463,6 +471,14 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const cancelledSessionId = String(sessionId ?? "mock-session-1");
       cancelledSessions.set(cancelledSessionId, promptCount);
+      if (
+        promptCount === 1 &&
+        busyPromptFailuresRemaining === 0 &&
+        Number.isFinite(busyPromptFailuresAfterFirstCancel) &&
+        busyPromptFailuresAfterFirstCancel > 0
+      ) {
+        busyPromptFailuresRemaining = Math.floor(busyPromptFailuresAfterFirstCancel);
+      }
       if (emitLateUpdateAfterCancel) {
         yield* Effect.sleep("50 millis");
         yield* Effect.sync(() => {
@@ -489,6 +505,18 @@ const program = Effect.gen(function* () {
 
       if (failPrompt) {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
+      }
+
+      if (promptCount > 1 && busyPromptFailuresRemaining > 0) {
+        busyPromptFailuresRemaining -= 1;
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "mock busy rejection" },
+          },
+        });
+        return yield* AcpError.AcpRequestError.internalError("Internal error");
       }
 
       if (emitEmptyCompletion) {
@@ -552,6 +580,15 @@ const program = Effect.gen(function* () {
       }
 
       if (hangPromptForever || (hangFirstPromptForever && promptCount === 1)) {
+        if (hangFirstPromptForever) {
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "mock first prompt running" },
+            },
+          });
+        }
         return yield* Effect.never;
       }
 
@@ -685,7 +722,11 @@ const program = Effect.gen(function* () {
             title: "subagent",
             kind: "other",
             status: "in_progress",
-            rawInput: { sessionId: "mock-child-session-1", prompt: "inspect the repo" },
+            rawInput: {
+              mode: "blocking",
+              task: "inspect the repo",
+              stages: ["explore"],
+            },
           },
         });
         writeJsonRpcNotification("session/update", {
@@ -700,12 +741,12 @@ const program = Effect.gen(function* () {
           },
         });
         writeJsonRpcNotification("_kiro.dev/subagent/list_update", {
-          sessionId: requestedSessionId,
-          agents: [
+          subagents: [
             {
               sessionId: "mock-child-session-1",
-              status: "running",
-              title: "Explorer",
+              status: { type: "working", message: "Running" },
+              sessionName: "Explorer",
+              agentName: "kiro_default",
               role: "explore",
               lastToolName: "Child-only tool",
             },
@@ -716,8 +757,28 @@ const program = Effect.gen(function* () {
           messageCount: 1,
           senders: ["mock-child-session-1"],
         });
-        writeJsonRpcNotification("_session/terminate", {
+        writeJsonRpcNotification("_kiro.dev/subagent/list_update", {
+          subagents: [
+            {
+              sessionId: "mock-child-session-1",
+              status: { type: "terminated", message: "Completed" },
+              sessionName: "Explorer",
+              agentName: "kiro_default",
+              role: "explore",
+            },
+          ],
+        });
+        writeJsonRpcNotification("_kiro.dev/subagent/list_update", {
+          subagents: [],
+          pendingStages: [],
+        });
+        // Buffered output from a terminated child must not restart its task.
+        writeJsonRpcNotification("session/update", {
           sessionId: "mock-child-session-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "late child output" },
+          },
         });
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
@@ -735,6 +796,20 @@ const program = Effect.gen(function* () {
           },
         });
         return { stopReason: "end_turn" };
+      }
+
+      if (emitKiroLateContentAfterPromptResponse) {
+        yield* Effect.gen(function* () {
+          yield* Effect.sleep("25 millis");
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "late Kiro content" },
+            },
+          });
+        }).pipe(Effect.forkIn(programScope));
+        return { stopReason: "refusal" };
       }
 
       if (emitXAiPromptCompleteThenHang) {
@@ -1201,6 +1276,9 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
+    if (method === "_session/steer") {
+      return Effect.succeed({ queued: true, params });
+    }
     if (method === "cursor/list_available_models") {
       return Effect.succeed({
         models: availableModels(),

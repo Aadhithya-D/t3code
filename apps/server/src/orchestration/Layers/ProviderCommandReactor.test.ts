@@ -1258,6 +1258,158 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect("starts another thread while a provider session is still starting", () =>
+    Effect.gen(function* () {
+      const releaseStart = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startSessionEffect: (session) =>
+            session.threadId === ThreadId.make("thread-1")
+              ? Deferred.await(releaseStart).pipe(Effect.as(session))
+              : Effect.succeed(session),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const dispatchTurn = (threadId: string, id: string) =>
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-${id}`),
+          threadId: ThreadId.make(threadId),
+          message: { messageId: asMessageId(id), role: "user", text: id, attachments: [] },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        });
+
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-create-2"),
+        threadId: ThreadId.make("thread-2"),
+        projectId: asProjectId("project-1"),
+        title: "Thread 2",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+      });
+
+      yield* dispatchTurn("thread-1", "hung-start");
+      yield* Effect.promise(() => waitFor(() => harness.startSession.mock.calls.length === 1));
+
+      // thread-1 is parked inside startSession; thread-2 must not queue behind it.
+      yield* dispatchTurn("thread-2", "independent-start");
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+      expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+        threadId: ThreadId.make("thread-2"),
+      });
+
+      yield* Deferred.succeed(releaseStart, undefined);
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 2));
+    }),
+  );
+
+  effectIt.effect("a follow-up sent during a slow start reuses that thread's session", () =>
+    Effect.gen(function* () {
+      const releaseStart = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startSessionEffect: (session) =>
+            session.threadId === ThreadId.make("thread-1")
+              ? Deferred.await(releaseStart).pipe(Effect.as(session))
+              : Effect.succeed(session),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const dispatchTurn = (threadId: string, id: string) =>
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-${id}`),
+          threadId: ThreadId.make(threadId),
+          message: { messageId: asMessageId(id), role: "user", text: id, attachments: [] },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        });
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-create-barrier"),
+        threadId: ThreadId.make("thread-2"),
+        projectId: asProjectId("project-1"),
+        title: "Barrier",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+      });
+
+      yield* dispatchTurn("thread-1", "first");
+      yield* Effect.promise(() => waitFor(() => harness.startSession.mock.calls.length === 1));
+      yield* dispatchTurn("thread-1", "follow-up");
+      // The worker is serial, so once thread-2's turn is sent the follow-up has been handled.
+      yield* dispatchTurn("thread-2", "barrier");
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+      expect(harness.startSession.mock.calls.map((call) => call[0])).toEqual([
+        ThreadId.make("thread-1"),
+        ThreadId.make("thread-2"),
+      ]);
+
+      yield* Deferred.succeed(releaseStart, undefined);
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 3));
+      // A second startSession for thread-1 would have torn down the session that just came up.
+      expect(harness.startSession).toHaveBeenCalledTimes(2);
+      expect(harness.stopSession).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect("a stop request aborts a provider session that is still starting", () =>
+    Effect.gen(function* () {
+      const releaseStart = yield* Deferred.make<void>();
+      const startInterrupted = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startSessionEffect: (session) =>
+            Deferred.await(releaseStart).pipe(
+              Effect.as(session),
+              Effect.onInterrupt(() => Deferred.succeed(startInterrupted, undefined)),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-then-stop"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-then-stop"),
+          role: "user",
+          text: "start slowly",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+      yield* Effect.promise(() => waitFor(() => harness.startSession.mock.calls.length === 1));
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-stop-while-starting"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+      });
+
+      yield* Deferred.await(startInterrupted);
+      yield* Deferred.succeed(releaseStart, undefined);
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+    }),
+  );
+
   effectIt.effect("shows the missing workspace message without a provider stack trace", () =>
     Effect.gen(function* () {
       const attempted = yield* Deferred.make<void>();

@@ -47,6 +47,10 @@ const emitKiroLateContentAfterPromptResponse =
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
+// Kiro CLI 2.19 emits `_kiro.dev/subagent/list_update` before answering session/new.
+const emitKiroSubagentListBeforeSessionNew =
+  process.env.T3_ACP_EMIT_KIRO_SUBAGENT_LIST_BEFORE_SESSION_NEW === "1";
+const hangSessionNew = process.env.T3_ACP_HANG_SESSION_NEW === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
@@ -446,6 +450,15 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleCreateSession(() =>
     Effect.gen(function* () {
+      if (hangSessionNew) {
+        return yield* Effect.never;
+      }
+      if (emitKiroSubagentListBeforeSessionNew) {
+        writeJsonRpcNotification("_kiro.dev/subagent/list_update", {
+          subagents: [],
+          pendingStages: [],
+        });
+      }
       if (antigravityProfile) {
         yield* publishAntigravityCommands(sessionId);
       }

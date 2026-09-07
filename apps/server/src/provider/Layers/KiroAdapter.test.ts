@@ -99,6 +99,41 @@ it.layer(testLayer)("KiroAdapter", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("starts when Kiro sends its subagent list before answering session/new", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-early-subagent-list");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_EMIT_KIRO_SUBAGENT_LIST_BEFORE_SESSION_NEW: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }));
+      const events: ProviderRuntimeEvent[] = [];
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)),
+      ).pipe(Effect.forkChild);
+
+      // Before the fix the notification handler drained an event queue nobody
+      // consumed yet, blocking the RPC read loop so session/new never resolved.
+      const session = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("kiro"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.timeout("10 seconds"));
+      assert.equal(session.status, "ready");
+
+      yield* adapter.sendTurn({ threadId, input: "hello kiro", attachments: [] });
+      assert.include(
+        events.map((event) => event.type),
+        "turn.completed",
+      );
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("stops an in-flight message and accepts a follow-up", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("kiro-interrupt");

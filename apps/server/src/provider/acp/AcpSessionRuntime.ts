@@ -869,7 +869,21 @@ export const make = (
         const created = yield* runLoggedRequest(
           "session/new",
           createPayload,
-          acp.agent.createSession(createPayload),
+          acp.agent.createSession(createPayload).pipe(
+            Effect.timeoutOption(options.sessionLoadTimeout ?? defaultSessionLoadTimeout),
+            Effect.flatMap((result) =>
+              Option.isSome(result)
+                ? Effect.succeed(result.value)
+                : Effect.fail(
+                    new EffectAcpErrors.AcpTransportError({
+                      operation: "call-rpc",
+                      method: "session/new",
+                      detail: "session/new timed out waiting for the agent response.",
+                      cause: undefined,
+                    }),
+                  ),
+            ),
+          ),
         );
         sessionId = created.sessionId;
         sessionSetupResult = created;
@@ -936,6 +950,13 @@ export const make = (
 
     const drainEvents = Effect.gen(function* () {
       if (yield* Ref.get(stoppingRef)) {
+        return;
+      }
+      // Nothing consumes the queue until startup finishes. A notification handler
+      // that drains during `session/new` (Kiro's subagent list arrives before the
+      // response) would otherwise block the RPC read loop on a barrier nobody
+      // acknowledges, and the response behind it is never read.
+      if ((yield* Ref.get(startStateRef))._tag !== "Started") {
         return;
       }
       const acknowledge = yield* Deferred.make<void>();

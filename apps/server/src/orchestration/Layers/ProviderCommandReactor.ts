@@ -21,12 +21,14 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TxRef from "effect/TxRef";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -347,6 +349,22 @@ const make = Effect.gen(function* () {
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
   const stoppingThreadIds = new Set<ThreadId>();
+  // Turn starts run off the serial worker so one hung provider start (a
+  // `session/new` that never answers) cannot park every other thread. Within a
+  // thread they stay ordered: each start waits for the previous one, so a
+  // follow-up sent during a slow start finds the live session instead of
+  // starting a second one. Stop and interrupt requests abort in-flight starts.
+  interface InFlightTurnStart {
+    fiber?: Fiber.Fiber<void>;
+  }
+  const inFlightTurnStarts = new Map<ThreadId, Array<InFlightTurnStart>>();
+  const outstandingTurnStarts = yield* TxRef.make(0);
+  const interruptInFlightTurnStarts = (threadId: ThreadId) =>
+    Effect.forEach(
+      inFlightTurnStarts.get(threadId) ?? [],
+      (entry) => (entry.fiber ? Fiber.interrupt(entry.fiber) : Effect.void),
+      { discard: true },
+    );
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -1692,6 +1710,47 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const forkTurnStart = (
+    event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
+  ) =>
+    Effect.gen(function* () {
+      const threadId = event.payload.threadId;
+      const lane = inFlightTurnStarts.get(threadId) ?? [];
+      const previous = lane.at(-1)?.fiber;
+      const entry: InFlightTurnStart = {};
+      inFlightTurnStarts.set(threadId, [...lane, entry]);
+      yield* TxRef.update(outstandingTurnStarts, (count) => count + 1).pipe(Effect.tx);
+      entry.fiber = yield* Effect.gen(function* () {
+        if (previous) {
+          yield* Fiber.await(previous);
+        }
+        yield* processTurnStartRequested(event);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : Effect.logWarning("provider command reactor failed to process event", {
+                eventType: event.type,
+                cause: Cause.pretty(cause),
+              }),
+        ),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            const remaining = (inFlightTurnStarts.get(threadId) ?? []).filter(
+              (candidate) => candidate !== entry,
+            );
+            if (remaining.length === 0) {
+              inFlightTurnStarts.delete(threadId);
+            } else {
+              inFlightTurnStarts.set(threadId, remaining);
+            }
+            yield* TxRef.update(outstandingTurnStarts, (count) => count - 1).pipe(Effect.tx);
+          }),
+        ),
+        Effect.forkScoped,
+      );
+    });
+
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (
     event: ProviderIntentEvent,
   ) {
@@ -1721,9 +1780,10 @@ const make = Effect.gen(function* () {
         return;
       }
       case "thread.turn-start-requested":
-        yield* processTurnStartRequested(event);
+        yield* forkTurnStart(event);
         return;
       case "thread.turn-interrupt-requested":
+        yield* interruptInFlightTurnStarts(event.payload.threadId);
         yield* processTurnInterruptRequested(event);
         return;
       case "thread.approval-response-requested":
@@ -1733,6 +1793,7 @@ const make = Effect.gen(function* () {
         yield* processUserInputResponseRequested(event);
         return;
       case "thread.session-stop-requested":
+        yield* interruptInFlightTurnStarts(event.payload.threadId);
         yield* processSessionStopRequested(event);
         return;
       case "thread.settled": {
@@ -1832,6 +1893,10 @@ const make = Effect.gen(function* () {
     start,
     drain: Effect.gen(function* () {
       yield* worker.drain;
+      yield* TxRef.get(outstandingTurnStarts).pipe(
+        Effect.tap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
+        Effect.tx,
+      );
       yield* threadTitleRegenerationWorker.drain;
     }),
   } satisfies ProviderCommandReactorShape;

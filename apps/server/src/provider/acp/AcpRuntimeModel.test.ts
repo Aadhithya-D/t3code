@@ -11,6 +11,7 @@ import {
   parseSessionUpdateEvent,
   sessionUpdateIsReplay,
   syntheticLoadSessionResponseFromInitialize,
+  syntheticNewSessionResponseFromInitialize,
   toolCallProgressLength,
   type AcpToolCallState,
 } from "./AcpRuntimeModel.ts";
@@ -99,6 +100,25 @@ describe("AcpRuntimeModel", () => {
 
     expect(response.models?.currentModelId).toBe("grok-build");
     expect(response._meta).toMatchObject({ t3SessionLoadReady: "replay_idle" });
+  });
+
+  it("builds a synthetic new-session response from initialize model state", () => {
+    const response = syntheticNewSessionResponseFromInitialize({
+      initializeResult: {
+        protocolVersion: 1,
+        _meta: {
+          modelState: {
+            currentModelId: "grok-build",
+            availableModels: [{ modelId: "grok-build", name: "Grok Build" }],
+          },
+        },
+      },
+      sessionId: "kiro-session-1",
+    });
+
+    expect(response.sessionId).toBe("kiro-session-1");
+    expect(response.models?.currentModelId).toBe("grok-build");
+    expect(response._meta).toMatchObject({ t3SessionNewReady: "setup_idle" });
   });
 
   it("accepts initialize model descriptions with null", () => {

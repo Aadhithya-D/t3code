@@ -49,6 +49,8 @@ const omitXAiPromptCompleteStopReason =
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
+const hangSessionNew = process.env.T3_ACP_HANG_SESSION_NEW === "1";
+const hangSessionNewAfterSetup = process.env.T3_ACP_HANG_SESSION_NEW_AFTER_SETUP === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
 const loadSessionDelayMs = Number(process.env.T3_ACP_LOAD_SESSION_DELAY_MS ?? "5000");
 const emitStaleXAiPromptCompleteBeforeSecondHang =
@@ -446,6 +448,20 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleCreateSession(() =>
     Effect.gen(function* () {
+      if (hangSessionNewAfterSetup) {
+        writeJsonRpcNotification("_kiro.dev/mcp/server_initialized", {
+          sessionId,
+          serverName: "t3-code",
+        });
+        writeJsonRpcNotification("_kiro.dev/commands/available", {
+          sessionId,
+          commands: [],
+        });
+        return yield* Effect.never;
+      }
+      if (hangSessionNew) {
+        return yield* Effect.never;
+      }
       if (antigravityProfile) {
         yield* publishAntigravityCommands(sessionId);
       }

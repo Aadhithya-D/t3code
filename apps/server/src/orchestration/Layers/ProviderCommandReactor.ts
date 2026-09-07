@@ -21,12 +21,15 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TxRef from "effect/TxRef";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -347,6 +350,15 @@ const make = Effect.gen(function* () {
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
   const stoppingThreadIds = new Set<ThreadId>();
+  const outstandingTurnStarts = yield* TxRef.make(0);
+  const inFlightTurnStartFibers = yield* Ref.make(new Map<string, Fiber.Fiber<void, never>>());
+  const interruptInFlightTurnStart = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const inFlightStart = (yield* Ref.get(inFlightTurnStartFibers)).get(threadId);
+      if (inFlightStart) {
+        yield* Fiber.interrupt(inFlightStart).pipe(Effect.ignore);
+      }
+    });
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -1453,6 +1465,7 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
+    yield* interruptInFlightTurnStart(event.payload.threadId);
     if (!session || session.status === "stopped") {
       return yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
@@ -1637,6 +1650,7 @@ const make = Effect.gen(function* () {
     }
 
     const now = event.payload.createdAt;
+    yield* interruptInFlightTurnStart(thread.id);
     const wasCompacting = compactingThreadIds.has(thread.id);
     stoppingThreadIds.add(thread.id);
     const clearStopping = Effect.sync(() => void stoppingThreadIds.delete(thread.id));
@@ -1721,7 +1735,7 @@ const make = Effect.gen(function* () {
         return;
       }
       case "thread.turn-start-requested":
-        yield* processTurnStartRequested(event);
+        yield* forkTurnStart(event);
         return;
       case "thread.turn-interrupt-requested":
         yield* processTurnInterruptRequested(event);
@@ -1756,6 +1770,21 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const processTurnStartRequestedSafely = (
+    event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
+  ) =>
+    processTurnStartRequested(event).pipe(
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) {
+          return Effect.interrupt;
+        }
+        return Effect.logWarning("provider command reactor failed to process event", {
+          eventType: event.type,
+          cause: Cause.pretty(cause),
+        });
+      }),
+    );
+
   const processDomainEventSafely = (event: ProviderIntentEvent) =>
     processDomainEvent(event).pipe(
       Effect.catchCause((cause) => {
@@ -1768,6 +1797,38 @@ const make = Effect.gen(function* () {
         });
       }),
     );
+
+  const forkTurnStart = (
+    event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
+  ) =>
+    Effect.gen(function* () {
+      yield* TxRef.update(outstandingTurnStarts, (count) => count + 1).pipe(Effect.tx);
+      const holder: { fiber?: Fiber.Fiber<void, never> } = {};
+      holder.fiber = yield* processTurnStartRequestedSafely(event).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            yield* Ref.update(inFlightTurnStartFibers, (current) => {
+              const next = new Map(current);
+              if (holder.fiber !== undefined && next.get(event.payload.threadId) === holder.fiber) {
+                next.delete(event.payload.threadId);
+              }
+              return next;
+            });
+            yield* TxRef.update(outstandingTurnStarts, (count) => Math.max(0, count - 1)).pipe(
+              Effect.tx,
+            );
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Ref.update(inFlightTurnStartFibers, (current) => {
+        const next = new Map(current);
+        if (holder.fiber !== undefined) {
+          next.set(event.payload.threadId, holder.fiber);
+        }
+        return next;
+      });
+    });
 
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
@@ -1832,6 +1893,10 @@ const make = Effect.gen(function* () {
     start,
     drain: Effect.gen(function* () {
       yield* worker.drain;
+      yield* TxRef.get(outstandingTurnStarts).pipe(
+        Effect.tap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
+        Effect.tx,
+      );
       yield* threadTitleRegenerationWorker.drain;
     }),
   } satisfies ProviderCommandReactorShape;

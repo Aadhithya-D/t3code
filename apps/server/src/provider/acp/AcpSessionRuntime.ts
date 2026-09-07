@@ -33,6 +33,8 @@ import {
   parseSessionUpdateEvent,
   sessionUpdateIsReplay,
   waitForSessionLoadReplayIdle,
+  waitForSessionNewIdle,
+  sessionIdFromUnknown,
   type SessionLoadGate,
   type AcpParsedSessionEvent,
   type AcpSessionModeState,
@@ -71,6 +73,7 @@ export interface AcpChildSessionEvent {
 }
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
+const defaultSessionNewTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
 const defaultCancelTimeout = Duration.seconds(15);
 const maxStartupMetadataUpdates = 32;
@@ -91,7 +94,9 @@ export interface AcpSessionRuntimeOptions {
   readonly resumeSessionId?: string;
   readonly resumeMethod?: "load" | "resume";
   readonly sessionLoadTimeout?: Duration.Input;
+  readonly sessionNewTimeout?: Duration.Input;
   readonly sessionLoadReplayIdleGap?: Duration.Input;
+  readonly sessionNewIdleGap?: Duration.Input;
   /** Native cancellation waits for the prompt response and the getEvents consumer to drain. */
   readonly cancelBehavior?: "interrupt" | "wait-for-prompt";
   readonly cancelTimeout?: Duration.Input;
@@ -371,6 +376,26 @@ export const make = (
     const promptDispatchSemaphore = yield* Semaphore.make(1);
     const activePromptRef = yield* Ref.make<Option.Option<AcpActivePrompt>>(Option.none());
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
+    const touchSessionSetupGate = (payload?: unknown) =>
+      Effect.gen(function* () {
+        const gate = yield* Ref.get(sessionLoadGateRef);
+        if (Option.isNone(gate) || !gate.value.active) {
+          return;
+        }
+        const sessionId = sessionIdFromUnknown(payload) ?? gate.value.sessionId;
+        if (options.resumeSessionId && sessionId !== options.resumeSessionId) {
+          return;
+        }
+        const lastActivityAtMillis = yield* Clock.currentTimeMillis;
+        yield* Ref.set(
+          sessionLoadGateRef,
+          Option.some({
+            ...gate.value,
+            lastActivityAtMillis,
+            ...(sessionId ? { sessionId } : {}),
+          }),
+        );
+      });
 
     const ensureConnected = Effect.gen(function* () {
       const error = yield* Ref.get(terminationErrorRef);
@@ -500,6 +525,8 @@ export const make = (
 
     const acp = yield* Effect.service(EffectAcpClient.AcpClient).pipe(Effect.provide(acpContext));
 
+    yield* acp.handleUnknownExtNotification((_method, params) => touchSessionSetupGate(params));
+
     const processSessionUpdate = (notification: EffectAcpSchema.SessionNotification) =>
       handleSessionUpdate({
         queue: eventQueue,
@@ -517,21 +544,7 @@ export const make = (
           if (Option.isSome(yield* Ref.get(terminationErrorRef))) {
             return;
           }
-          const gate = yield* Ref.get(sessionLoadGateRef);
-          if (
-            Option.isSome(gate) &&
-            gate.value.active &&
-            notification.sessionId === options.resumeSessionId
-          ) {
-            const lastActivityAtMillis = yield* Clock.currentTimeMillis;
-            yield* Ref.set(
-              sessionLoadGateRef,
-              Option.some({
-                ...gate.value,
-                lastActivityAtMillis,
-              }),
-            );
-          }
+          yield* touchSessionSetupGate(notification);
           if (sessionUpdateIsReplay(notification)) {
             return;
           }
@@ -866,11 +879,74 @@ export const make = (
             ? { additionalDirectories: options.additionalDirectories }
             : {}),
         } satisfies EffectAcpSchema.NewSessionRequest;
-        const created = yield* runLoggedRequest(
-          "session/new",
-          createPayload,
-          acp.agent.createSession(createPayload),
+        const sessionNewTimeout = Duration.fromInputUnsafe(
+          options.sessionNewTimeout ?? defaultSessionNewTimeout,
         );
+        const sessionNewIdleGap = Duration.fromInputUnsafe(
+          options.sessionNewIdleGap ?? defaultSessionLoadReplayIdleGap,
+        );
+
+        yield* Ref.set(
+          sessionLoadGateRef,
+          Option.some({
+            active: true,
+            lastActivityAtMillis: undefined,
+            idleGap: sessionNewIdleGap,
+            initializeResult,
+          }),
+        );
+
+        const created = yield* Effect.gen(function* () {
+          yield* logRequest({
+            method: "session/new",
+            payload: createPayload,
+            status: "started",
+          });
+
+          const idleFiber = yield* waitForSessionNewIdle({
+            gateRef: sessionLoadGateRef,
+          }).pipe(Effect.forkIn(runtimeScope));
+          const createdSession = yield* Effect.raceFirst(
+            acp.agent.createSession(createPayload),
+            Fiber.join(idleFiber),
+          ).pipe(
+            Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
+            Effect.timeoutOption(sessionNewTimeout),
+            Effect.flatMap((result) =>
+              Option.match(result, {
+                onNone: () =>
+                  Effect.fail(
+                    new EffectAcpErrors.AcpTransportError({
+                      operation: "call-rpc",
+                      method: "session/new",
+                      detail:
+                        "session/new timed out waiting for RPC response or setup idle gap",
+                      cause: undefined,
+                    }),
+                  ),
+                onSome: Effect.succeed,
+              }),
+            ),
+            Effect.tap((result) =>
+              logRequest({
+                method: "session/new",
+                payload: createPayload,
+                status: "succeeded",
+                result,
+              }),
+            ),
+            Effect.onError((cause) =>
+              logRequest({
+                method: "session/new",
+                payload: createPayload,
+                status: "failed",
+                cause,
+              }),
+            ),
+          );
+
+          return createdSession;
+        }).pipe(Effect.ensuring(Ref.set(sessionLoadGateRef, Option.none())));
         sessionId = created.sessionId;
         sessionSetupResult = created;
       }
@@ -936,6 +1012,10 @@ export const make = (
 
     const drainEvents = Effect.gen(function* () {
       if (yield* Ref.get(stoppingRef)) {
+        return;
+      }
+      const startState = yield* Ref.get(startStateRef);
+      if (startState._tag !== "Started") {
         return;
       }
       const acknowledge = yield* Deferred.make<void>();
@@ -1004,9 +1084,15 @@ export const make = (
       handleSessionUpdate: acp.handleSessionUpdate,
       handleElicitationComplete: acp.handleElicitationComplete,
       handleUnknownExtRequest: acp.handleUnknownExtRequest,
-      handleUnknownExtNotification: acp.handleUnknownExtNotification,
+      handleUnknownExtNotification: (handler) =>
+        acp.handleUnknownExtNotification((method, params) =>
+          touchSessionSetupGate(params).pipe(Effect.andThen(handler(method, params))),
+        ),
       handleExtRequest: acp.handleExtRequest,
-      handleExtNotification: acp.handleExtNotification,
+      handleExtNotification: (method, payload, handler) =>
+        acp.handleExtNotification(method, payload, (params) =>
+          touchSessionSetupGate(params).pipe(Effect.andThen(handler(params))),
+        ),
       initialize: () => ensureConnected.pipe(Effect.andThen(sendInitialize)),
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),

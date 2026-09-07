@@ -704,28 +704,61 @@ export interface SessionLoadGate {
   readonly lastActivityAtMillis: number | undefined;
   readonly idleGap: Duration.Duration;
   readonly initializeResult: EffectAcpSchema.InitializeResponse;
+  readonly sessionId?: string;
 }
 
-export const waitForSessionLoadReplayIdle = (input: {
+export function sessionIdFromUnknown(payload: unknown): string | undefined {
+  if (!isRecord(payload) || typeof payload.sessionId !== "string") {
+    return undefined;
+  }
+  const sessionId = payload.sessionId.trim();
+  return sessionId.length > 0 ? sessionId : undefined;
+}
+
+const waitForSessionSetupIdle = <A>(input: {
   readonly gateRef: Ref.Ref<Option.Option<SessionLoadGate>>;
-}): Effect.Effect<EffectAcpSchema.LoadSessionResponse, never> =>
+  readonly isReady: (gate: SessionLoadGate) => boolean;
+  readonly build: (gate: SessionLoadGate) => A;
+}): Effect.Effect<A, never> =>
   Effect.gen(function* () {
     const pollInterval = Duration.millis(25);
     while (true) {
       const gate = yield* Ref.get(input.gateRef);
-      if (
-        Option.isSome(gate) &&
-        gate.value.active &&
-        gate.value.lastActivityAtMillis !== undefined
-      ) {
+      if (Option.isSome(gate) && gate.value.active && input.isReady(gate.value)) {
         const idleGapMillis = Duration.toMillis(gate.value.idleGap);
         const nowMillis = yield* Clock.currentTimeMillis;
-        if (nowMillis - gate.value.lastActivityAtMillis >= idleGapMillis) {
-          return syntheticLoadSessionResponseFromInitialize(gate.value.initializeResult);
+        const lastActivityAtMillis = gate.value.lastActivityAtMillis;
+        if (
+          lastActivityAtMillis !== undefined &&
+          nowMillis - lastActivityAtMillis >= idleGapMillis
+        ) {
+          return input.build(gate.value);
         }
       }
       yield* Effect.sleep(pollInterval);
     }
+  });
+
+export const waitForSessionLoadReplayIdle = (input: {
+  readonly gateRef: Ref.Ref<Option.Option<SessionLoadGate>>;
+}): Effect.Effect<EffectAcpSchema.LoadSessionResponse, never> =>
+  waitForSessionSetupIdle({
+    gateRef: input.gateRef,
+    isReady: (gate) => gate.lastActivityAtMillis !== undefined,
+    build: (gate) => syntheticLoadSessionResponseFromInitialize(gate.initializeResult),
+  });
+
+export const waitForSessionNewIdle = (input: {
+  readonly gateRef: Ref.Ref<Option.Option<SessionLoadGate>>;
+}): Effect.Effect<EffectAcpSchema.NewSessionResponse, never> =>
+  waitForSessionSetupIdle({
+    gateRef: input.gateRef,
+    isReady: (gate) => gate.lastActivityAtMillis !== undefined && gate.sessionId !== undefined,
+    build: (gate) =>
+      syntheticNewSessionResponseFromInitialize({
+        initializeResult: gate.initializeResult,
+        sessionId: gate.sessionId ?? "",
+      }),
   });
 
 /**
@@ -740,19 +773,40 @@ export function sessionModelStateFromInitialize(
   return isSessionModelState(modelState) ? modelState : undefined;
 }
 
-export function syntheticLoadSessionResponseFromInitialize(
-  initializeResult: EffectAcpSchema.InitializeResponse,
-): EffectAcpSchema.LoadSessionResponse {
+function sessionSetupModelsAndModes(initializeResult: EffectAcpSchema.InitializeResponse): {
+  readonly models?: EffectAcpSchema.SessionModelState;
+  readonly modes?: EffectAcpSchema.SessionModeState;
+} {
   const meta = initializeResult._meta;
   const modeState = isRecord(meta) ? meta.modeState : undefined;
   const models = sessionModelStateFromInitialize(initializeResult);
   const modes = isSessionModeState(modeState) ? modeState : undefined;
-
   return {
     ...(models ? { models } : {}),
     ...(modes ? { modes } : {}),
+  };
+}
+
+export function syntheticLoadSessionResponseFromInitialize(
+  initializeResult: EffectAcpSchema.InitializeResponse,
+): EffectAcpSchema.LoadSessionResponse {
+  return {
+    ...sessionSetupModelsAndModes(initializeResult),
     _meta: {
       t3SessionLoadReady: "replay_idle",
+    },
+  };
+}
+
+export function syntheticNewSessionResponseFromInitialize(input: {
+  readonly initializeResult: EffectAcpSchema.InitializeResponse;
+  readonly sessionId: string;
+}): EffectAcpSchema.NewSessionResponse {
+  return {
+    sessionId: input.sessionId,
+    ...sessionSetupModelsAndModes(input.initializeResult),
+    _meta: {
+      t3SessionNewReady: "setup_idle",
     },
   };
 }

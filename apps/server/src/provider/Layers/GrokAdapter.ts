@@ -1690,14 +1690,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapAcpCallbackFailure(
                   Effect.gen(function* () {
                     yield* logNative(input.threadId, KIRO_DEV_SUBAGENT_LIST_UPDATE_METHOD, params);
-                    // Standard child updates are queued separately from vendor
-                    // callbacks. Project preceding output before marking the
-                    // child terminal, otherwise its final tools can be lost.
-                    yield* acp.drainEvents;
                     const liveCtx = sessions.get(input.threadId);
                     if (!liveCtx) {
                       return;
                     }
+                    // Standard child updates are queued separately from vendor
+                    // callbacks. Project preceding output before marking the
+                    // child terminal, otherwise its final tools can be lost.
+                    yield* acp.drainEvents;
                     const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
                     if (turnId !== undefined) {
                       yield* touchTurnLiveness(liveCtx, turnId);
@@ -1757,11 +1757,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 mapAcpCallbackFailure(
                   Effect.gen(function* () {
                     yield* logNative(input.threadId, KIRO_SESSION_TERMINATE_METHOD, params);
-                    yield* acp.drainEvents;
                     const liveCtx = sessions.get(input.threadId);
                     if (!liveCtx) {
                       return;
                     }
+                    yield* acp.drainEvents;
                     const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
                     if (turnId !== undefined) {
                       yield* touchTurnLiveness(liveCtx, turnId);

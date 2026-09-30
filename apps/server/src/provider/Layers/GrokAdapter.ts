@@ -627,13 +627,15 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             | "AssistantItemCompleted"
             | "PlanUpdated"
             | "ToolCallUpdated"
-            | "ContentDelta";
+            | "ContentDelta"
+            | "ThoughtDelta";
         }
       >,
     ) {
       if (
         ctx.livenessTurnId !== turnId ||
-        (event._tag === "ContentDelta" && event.text.length === 0)
+        ((event._tag === "ContentDelta" || event._tag === "ThoughtDelta") &&
+          event.text.length === 0)
       ) {
         return;
       }
@@ -1274,46 +1276,45 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       );
     });
 
-    const runTurnLivenessWatchdog = Effect.fn("GrokAdapter.runTurnLivenessWatchdog")(
-      function* (ctx: GrokSessionContext) {
-        while (true) {
-          if (ctx.stopped) {
-            return;
-          }
-          const turnId = ctx.livenessTurnId;
-          if (
-            turnId === undefined ||
-            ctx.interruptedTurnIds.has(turnId) ||
-            !isLiveTurn(ctx, turnId) ||
-            hasLivenessPause(ctx)
-          ) {
-            yield* Queue.take(ctx.livenessSignals);
-            continue;
-          }
-
-          const lastActivityAtNanos = ctx.lastTurnActivityAtNanos;
-          if (lastActivityAtNanos === undefined) {
-            yield* Queue.take(ctx.livenessSignals);
-            continue;
-          }
-          const nowNanos = yield* Clock.monotonicTimeNanos;
-          const remainingNanos = livenessTimeoutFor(ctx).nanos - (nowNanos - lastActivityAtNanos);
-          if (remainingNanos <= 0n) {
-            yield* settleStalledTurn(ctx, turnId);
-            continue;
-          }
-
-          const wakeReason = yield* Effect.raceFirst(
-            Effect.sleep(Duration.nanos(remainingNanos)).pipe(Effect.as("timeout" as const)),
-            Queue.take(ctx.livenessSignals).pipe(Effect.as("activity" as const)),
-          );
-          if (wakeReason === "timeout") {
-            yield* settleStalledTurn(ctx, turnId);
-          }
+    const runTurnLivenessWatchdog = Effect.fn("GrokAdapter.runTurnLivenessWatchdog")(function* (
+      ctx: GrokSessionContext,
+    ) {
+      while (true) {
+        if (ctx.stopped) {
+          return;
         }
-      },
-      Effect.catch(() => Effect.void),
-    );
+        const turnId = ctx.livenessTurnId;
+        if (
+          turnId === undefined ||
+          ctx.interruptedTurnIds.has(turnId) ||
+          !isLiveTurn(ctx, turnId) ||
+          hasLivenessPause(ctx)
+        ) {
+          yield* Queue.take(ctx.livenessSignals);
+          continue;
+        }
+
+        const lastActivityAtNanos = ctx.lastTurnActivityAtNanos;
+        if (lastActivityAtNanos === undefined) {
+          yield* Queue.take(ctx.livenessSignals);
+          continue;
+        }
+        const nowNanos = yield* Clock.monotonicTimeNanos;
+        const remainingNanos = livenessTimeoutFor(ctx).nanos - (nowNanos - lastActivityAtNanos);
+        if (remainingNanos <= 0n) {
+          yield* settleStalledTurn(ctx, turnId);
+          continue;
+        }
+
+        const wakeReason = yield* Effect.raceFirst(
+          Effect.sleep(Duration.nanos(remainingNanos)).pipe(Effect.as("timeout" as const)),
+          Queue.take(ctx.livenessSignals).pipe(Effect.as("activity" as const)),
+        );
+        if (wakeReason === "timeout") {
+          yield* settleStalledTurn(ctx, turnId);
+        }
+      }
+    }, Effect.ignore());
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
       Effect.gen(function* () {
@@ -2191,16 +2192,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 ) {
                   return;
                 }
-                if (event._tag === "ThoughtDelta") {
-                  yield* touchTurnLiveness(ctx, notificationTurnId);
-                  return;
-                }
                 if (
                   event._tag === "AssistantItemStarted" ||
                   event._tag === "AssistantItemCompleted" ||
                   event._tag === "PlanUpdated" ||
                   event._tag === "ToolCallUpdated" ||
-                  event._tag === "ContentDelta"
+                  event._tag === "ContentDelta" ||
+                  event._tag === "ThoughtDelta"
                 ) {
                   ctx.activeTurnProducedOutput = true;
                   yield* recordTurnActivity(ctx, notificationTurnId, event);
@@ -2291,6 +2289,19 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     }
                     return;
                   }
+                  case "ThoughtDelta":
+                    yield* offerRuntimeEvent(
+                      makeAcpContentDeltaEvent({
+                        stamp,
+                        provider: PROVIDER,
+                        threadId: ctx.threadId,
+                        turnId: notificationTurnId,
+                        streamKind: "reasoning_text",
+                        text: event.text,
+                        rawPayload: event.rawPayload,
+                      }),
+                    );
+                    return;
                   case "ContentDelta":
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -2355,6 +2366,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     const sendTurn: GrokAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
+        if (/^\/always-approve(?:\s|$)/i.test(input.input?.trim() ?? "")) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/prompt",
+            detail: "Change permissions with T3's permission selector instead of /always-approve.",
+          });
+        }
         const steeredTurn = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
@@ -2537,12 +2555,17 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   ? resolveGrokAcpBaseModelId(currentModelId)
                   : resolveModelId(currentModelId)
                 : undefined;
-              const runtimeInstructions = buildRuntimeInstructions({
-                harness: providerDisplayName,
-                model: displayModel,
-                reasoningEffort:
-                  requestedEffort ?? normalizeGrokReasoningEffort(requestedTurnReasoningEffort),
-              });
+              // ACP slash commands must receive only their own arguments.
+              const runtimeInstructions =
+                text && /^\/[^\s/]+(?:\s|$)/.test(text)
+                  ? undefined
+                  : buildRuntimeInstructions({
+                      harness: providerDisplayName,
+                      model: displayModel,
+                      reasoningEffort:
+                        requestedEffort ??
+                        normalizeGrokReasoningEffort(requestedTurnReasoningEffort),
+                    });
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;
               }
@@ -2659,7 +2682,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           const promptPayload = {
             prompt: [
               ...prepared.promptParts,
-              { type: "text" as const, text: prepared.runtimeInstructions },
+              ...(prepared.runtimeInstructions
+                ? [{ type: "text" as const, text: prepared.runtimeInstructions }]
+                : []),
             ],
           };
           const promptOnce = (
@@ -2814,10 +2839,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
           if (postPromptQuietPeriodMs !== undefined) {
             // Kiro may put the JSON-RPC prompt response on stdout immediately
-            // before its last content and metadata notifications. Drain what
-            // is already queued, then keep the turn live until the stream is
-            // genuinely quiet (and all reported child sessions have ended).
-            yield* prepared.acp.drainEvents;
+            // before its last content and metadata notifications. Keep updates
+            // open until the stream is quiet and all child sessions have ended.
+            // drainEvents closes assistant updates after the prompt resolves.
             yield* waitForPostPromptQuiet(
               input.threadId,
               prepared.acpSessionId,
@@ -3005,7 +3029,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   errorMessage: errorMessage ?? `${providerDisplayName} prompt request failed.`,
                 }),
               );
-            }).pipe(Effect.catch(() => Effect.void)),
+            }).pipe(Effect.ignore),
           ),
         );
       });

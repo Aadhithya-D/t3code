@@ -7,7 +7,6 @@ import type {
   ServerProviderAuth,
   ServerProviderModel,
   ServerProviderState,
-  ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
@@ -23,7 +22,9 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
+import { HttpClient } from "effect/unstable/http";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import {
@@ -50,13 +51,94 @@ import {
 } from "../providerMaintenance.ts";
 import * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import { CursorListAvailableModelsResponse } from "../acp/CursorAcpExtension.ts";
-import {
-  cursorAuthTokenFromJson,
-  cursorCliAuthJsonPath,
-  cursorPeriodUsageToLimits,
-  cursorStatusAccessToken,
-} from "./cursorUsageLimits.ts";
-import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
+import type { ServerProviderShape } from "../Services/ServerProvider.ts";
+
+/** Session command catalogs stay scoped to their workspace across health refreshes. */
+export const makeCursorCommandCatalog = Effect.fn("makeCursorCommandCatalog")(function* (
+  provider: ServerProviderShape,
+) {
+  const workspaces = yield* SubscriptionRef.make<NonNullable<ServerProvider["workspaceSnapshots"]>>(
+    [],
+  );
+  const getSnapshot = Effect.all([provider.getSnapshot, SubscriptionRef.get(workspaces)]).pipe(
+    Effect.map(([snapshot, workspaceSnapshots]) =>
+      workspaceSnapshots.length > 0 ? { ...snapshot, workspaceSnapshots } : snapshot,
+    ),
+  );
+  const snapshotForCwd = Effect.fn("CursorCommandCatalog.snapshotForCwd")(function* (
+    cwd: string,
+    skills: ServerProvider["skills"],
+  ) {
+    const machineSnapshot = yield* provider.getSnapshot;
+    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* SubscriptionRef.update(workspaces, (entries) =>
+      [
+        ...entries.filter((entry) => entry.cwd !== cwd),
+        {
+          cwd,
+          checkedAt,
+          slashCommands:
+            entries.find((entry) => entry.cwd === cwd)?.slashCommands ??
+            machineSnapshot.slashCommands,
+          skills,
+        },
+      ].slice(-16),
+    );
+    const snapshot = yield* getSnapshot;
+    return {
+      ...snapshot,
+      checkedAt,
+      slashCommands:
+        snapshot.workspaceSnapshots?.find((entry) => entry.cwd === cwd)?.slashCommands ??
+        snapshot.slashCommands,
+      skills,
+    };
+  });
+  const onAvailableCommands = Effect.fn("CursorCommandCatalog.onAvailableCommands")(function* (
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+    cwd: string,
+    skills: ServerProvider["skills"],
+  ) {
+    const seen = new Set([COMPACT_SLASH_COMMAND.name]);
+    const slashCommands = [
+      COMPACT_SLASH_COMMAND,
+      ...commands.flatMap((command) => {
+        const name = command.name.trim();
+        if (!name || seen.has(name)) return [];
+        seen.add(name);
+        const description = command.description.trim();
+        const hint = command.input?.hint.trim();
+        return [
+          {
+            name,
+            ...(description ? { description } : {}),
+            ...(hint ? { input: { hint } } : {}),
+          },
+        ];
+      }),
+    ];
+    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* SubscriptionRef.update(workspaces, (entries) =>
+      [
+        ...entries.filter((entry) => entry.cwd !== cwd),
+        { cwd, checkedAt, slashCommands, skills },
+      ].slice(-16),
+    );
+  });
+  return {
+    onAvailableCommands,
+    snapshotForCwd,
+    snapshot: {
+      ...provider,
+      getSnapshot,
+      refresh: provider.refresh.pipe(Effect.andThen(getSnapshot)),
+      streamChanges: Stream.merge(
+        provider.streamChanges.pipe(Stream.map(() => undefined)),
+        SubscriptionRef.changes(workspaces).pipe(Stream.map(() => undefined)),
+      ).pipe(Stream.mapEffect(() => getSnapshot)),
+    } satisfies ServerProviderShape,
+  };
+});
 
 const decodeCursorListAvailableModelsResponse = Schema.decodeUnknownEffect(
   CursorListAvailableModelsResponse,
@@ -596,8 +678,11 @@ export const makeCursorModelDiscovery = Effect.fn("makeCursorModelDiscovery")(fu
         Exit.isSuccess(exit) && exit.value.length > 0 ? Duration.minutes(30) : Duration.zero,
     },
   );
-  return (about: Pick<CursorAboutResult, "version" | "auth">) =>
-    Cache.get(cache, JSON.stringify([about.version, about.auth]));
+  return {
+    discover: (about: Pick<CursorAboutResult, "version" | "auth">) =>
+      Cache.get(cache, JSON.stringify([about.version, about.auth])),
+    invalidate: Cache.invalidateAll(cache),
+  };
 });
 
 function getCursorFallbackModels(
@@ -608,9 +693,6 @@ function getCursorFallbackModels(
 
 /** Timeout for `agent about` — it's slower than a simple `--version` probe. */
 const ABOUT_TIMEOUT_MS = 8_000;
-const STATUS_TIMEOUT_MS = 8_000;
-const CURSOR_DASHBOARD_USAGE_URL =
-  "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 
 /** Strip ANSI escape sequences so we can parse plain key-value lines. */
 function stripAnsi(text: string): string {
@@ -660,7 +742,6 @@ export function buildCursorProviderSnapshot(input: {
   readonly parsed: CursorAboutResult;
   readonly discoveredModels?: ReadonlyArray<ServerProviderModel>;
   readonly discoveryWarning?: string;
-  readonly usageLimits?: ServerProviderUsageLimits;
 }): ServerProviderDraft {
   const message = joinProviderMessages(input.parsed.message, input.discoveryWarning);
   return buildServerProvider({
@@ -680,7 +761,6 @@ export function buildCursorProviderSnapshot(input: {
         input.discoveryWarning && input.parsed.status === "ready" ? "warning" : input.parsed.status,
       auth: input.parsed.auth,
       ...(message ? { message } : {}),
-      ...(input.usageLimits ? { usageLimits: input.usageLimits } : {}),
     },
   });
 }
@@ -1019,97 +1099,6 @@ const runCursorAboutCommand = (cursorSettings: CursorSettings, environment?: Nod
     return yield* runCursorCommand(cursorSettings, ["about"], environment);
   });
 
-const fetchCursorDashboardUsage = (token: string) =>
-  Effect.gen(function* () {
-    const httpClient = yield* Effect.serviceOption(HttpClient.HttpClient);
-    if (Option.isNone(httpClient)) {
-      return undefined;
-    }
-    const request = HttpClientRequest.post(CURSOR_DASHBOARD_USAGE_URL).pipe(
-      HttpClientRequest.setHeaders({
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Connect-Protocol-Version": "1",
-      }),
-      HttpClientRequest.bodyJsonUnsafe({}),
-    );
-    return yield* httpClient.value.execute(request).pipe(
-      Effect.flatMap(HttpClientResponse.filterStatusOk),
-      Effect.flatMap((response) => response.json),
-      Effect.timeout("10 seconds"),
-      Effect.option,
-      Effect.map(Option.getOrUndefined),
-    );
-  });
-
-const cursorAuthEnvironment = (environment?: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
-  const env = environment ?? process.env;
-  return {
-    ...env,
-    HOME: env.HOME?.trim() || NodeOS.homedir(),
-  };
-};
-
-const readCursorCliAuthToken = (environment: NodeJS.ProcessEnv) =>
-  Effect.gen(function* () {
-    const fileSystem = yield* Effect.serviceOption(FileSystem.FileSystem);
-    if (Option.isNone(fileSystem)) {
-      return undefined;
-    }
-    const authJson = yield* fileSystem.value
-      .readFileString(cursorCliAuthJsonPath(environment))
-      .pipe(Effect.option);
-    if (Option.isNone(authJson)) {
-      return undefined;
-    }
-    try {
-      return cursorAuthTokenFromJson(JSON.parse(authJson.value) as unknown);
-    } catch {
-      return undefined;
-    }
-  });
-
-const probeCursorUsageLimits = (
-  cursorSettings: CursorSettings,
-  environment: NodeJS.ProcessEnv | undefined,
-  checkedAt: string,
-) =>
-  Effect.gen(function* () {
-    const statusProbe = yield* runCursorCommand(
-      cursorSettings,
-      ["status", "--format", "json"],
-      environment,
-    ).pipe(Effect.timeoutOption(STATUS_TIMEOUT_MS), Effect.result);
-    const statusStdout =
-      Result.isSuccess(statusProbe) && Option.isSome(statusProbe.success)
-        ? statusProbe.success.value.stdout
-        : undefined;
-    const token =
-      (statusStdout ? cursorStatusAccessToken(statusStdout) : undefined) ??
-      (yield* readCursorCliAuthToken(cursorAuthEnvironment(environment)));
-    if (!token) {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message:
-          statusStdout === undefined
-            ? "Could not read Cursor CLI auth status."
-            : "Cursor CLI did not report an access token.",
-      });
-    }
-    return (
-      cursorPeriodUsageToLimits({
-        payload: yield* fetchCursorDashboardUsage(token),
-        checkedAt,
-      }) ??
-      makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message: "Could not read Cursor subscription usage.",
-      })
-    );
-  });
-
 export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(function* (
   cursorSettings: CursorSettings,
   environment?: NodeJS.ProcessEnv,
@@ -1209,19 +1198,12 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
   }
   let discoveredModels = Option.none<ReadonlyArray<ServerProviderModel>>();
   let discoveryWarning: string | undefined;
-  let usageLimits: ServerProviderUsageLimits | undefined;
   if (parsed.auth.status !== "unauthenticated") {
-    const [discoveryExit, usageExit] = yield* Effect.all(
-      [
-        Effect.exit(
-          (discoverModels
-            ? discoverModels(parsed)
-            : discoverCursorModelsViaAcp(cursorSettings, environment)
-          ).pipe(Effect.timeoutOption(CURSOR_ACP_MODEL_DISCOVERY_TIMEOUT_MS)),
-        ),
-        Effect.exit(probeCursorUsageLimits(cursorSettings, environment, checkedAt)),
-      ],
-      { concurrency: 2 },
+    const discoveryExit = yield* Effect.exit(
+      (discoverModels
+        ? discoverModels(parsed)
+        : discoverCursorModelsViaAcp(cursorSettings, environment)
+      ).pipe(Effect.timeoutOption(CURSOR_ACP_MODEL_DISCOVERY_TIMEOUT_MS)),
     );
     if (Exit.isFailure(discoveryExit)) {
       yield* Effect.logWarning("Cursor ACP model discovery failed", {
@@ -1235,13 +1217,6 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
     } else {
       discoveredModels = discoveryExit.value;
     }
-    usageLimits = Exit.isSuccess(usageExit)
-      ? usageExit.value
-      : makeUnavailableUsageLimits({
-          checkedAt,
-          reason: "probeFailed",
-          message: "Could not read Cursor subscription usage.",
-        });
   }
   return buildCursorProviderSnapshot({
     checkedAt,
@@ -1252,7 +1227,6 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
       () => [] as const,
     ),
     ...(discoveryWarning ? { discoveryWarning } : {}),
-    ...(usageLimits ? { usageLimits } : {}),
   });
 });
 

@@ -116,6 +116,7 @@ export function parseKiroTurn(
 
   return {
     provider: "kiro",
+    fast: false,
     timestampMs,
     model,
     sessionId,

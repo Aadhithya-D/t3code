@@ -223,6 +223,7 @@ const desktopApplicationLayer = Layer.mergeAll(
 );
 
 const desktopClerkLayer = DesktopClerk.layer.pipe(
+  Layer.provideMerge(ElectronShell.layer),
   Layer.provideMerge(desktopEnvironmentLayer),
   Layer.provideMerge(NodeServices.layer),
   Layer.provideMerge(ElectronApp.layer),

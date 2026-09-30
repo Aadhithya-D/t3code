@@ -48,6 +48,7 @@ describe("parseKiroTurn", () => {
 
     expect(record).toEqual({
       provider: "kiro",
+      fast: false,
       timestampMs: Date.parse("2026-08-08T12:00:00.000Z"),
       model: "claude-opus-4.8",
       sessionId: "sess-1",

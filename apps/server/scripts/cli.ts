@@ -30,6 +30,7 @@ import {
   ServerCliPublishIconSourceMissingError,
   ServerCliPublishIconTargetMissingError,
 } from "./cliErrors.ts";
+import { publishPlatformsThenLauncher } from "./publishOrder.ts";
 
 const PackageJsonPrettyJson = fromJsonStringPretty(Schema.Unknown);
 const encodePackageJson = Schema.encodeEffect(PackageJsonPrettyJson);
@@ -394,7 +395,7 @@ const publishCmd = Command.make(
         if (config.provenance) args.push("--provenance");
         if (config.dryRun) args.push("--dry-run");
 
-        for (const tarball of [...platformTarballs, launcherTarball]) {
+        const publish = Effect.fn("publish")(function* (tarball: string) {
           const spawnCommand = yield* resolveSpawnCommand("npm", [...args, tarball]);
           yield* Effect.log(`[cli] npm ${args.join(" ")} ${path.basename(tarball)}`);
           yield* runCommand(
@@ -405,7 +406,8 @@ const publishCmd = Command.make(
               shell: spawnCommand.shell,
             }),
           );
-        }
+        });
+        yield* publishPlatformsThenLauncher({ platformTarballs, launcherTarball, publish });
         return;
       }
       const repoRoot = yield* RepoRoot;

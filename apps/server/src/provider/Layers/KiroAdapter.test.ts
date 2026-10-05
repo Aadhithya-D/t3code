@@ -62,6 +62,48 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(testLayer)("KiroAdapter", (it) => {
+  it.effect("retires a crashed process so a deliberate retry can resume", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("kiro-crash-recovery");
+      const binaryPath = yield* Effect.promise(() =>
+        makeMockKiroWrapper({ T3_ACP_CRASH_PROMPT: "1" }),
+      );
+      const adapter = yield* makeKiroAdapter(decodeKiroSettings({ binaryPath }));
+      const exited =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "session.exited"
+          ? Deferred.succeed(exited, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      const input = {
+        threadId,
+        provider: ProviderDriverKind.make("kiro"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access" as const,
+      };
+      const session = yield* adapter.startSession(input);
+      const failure = yield* Effect.flip(
+        adapter.sendTurn({ threadId, input: "crash now", attachments: [] }),
+      );
+      assert.isDefined(failure);
+      assert.isFalse(yield* adapter.hasSession(threadId));
+      const retryDuringTeardown = yield* Effect.flip(
+        adapter.sendTurn({ threadId, input: "retry during teardown", attachments: [] }),
+      );
+      assert.equal(retryDuringTeardown._tag, "ProviderAdapterSessionNotFoundError");
+      const exitEvent = yield* Deferred.await(exited);
+      assert.equal(exitEvent.provider, "kiro");
+      assert.equal(exitEvent.payload.exitKind, "error");
+      assert.deepStrictEqual(yield* adapter.listSessions(), []);
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.startSession({ ...input, resumeCursor: session.resumeCursor });
+      const turn = yield* adapter.sendTurn({ threadId, input: "retry now", attachments: [] });
+      assert.equal(turn.threadId, threadId);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("starts a session, sends a message, and streams the response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("kiro-message");

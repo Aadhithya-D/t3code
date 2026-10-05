@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
@@ -13,6 +14,7 @@ import {
 } from "@t3tools/contracts";
 import * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -67,6 +69,7 @@ const GROK_ACP_INITIALIZE_TIMEOUT_MS = 8_000;
 const GROK_ACP_BILLING_TIMEOUT_MS = 8_000;
 const GROK_CLI_PROXY_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const GROK_API_KEY_ENV = "XAI_API_KEY";
+const decodeAuthJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const GROK_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
@@ -398,13 +401,11 @@ const fetchGrokCliProxyBilling = (environment: NodeJS.ProcessEnv) =>
     if (Option.isNone(authJson)) {
       return undefined;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(authJson.value) as unknown;
-    } catch {
+    const parsed = yield* decodeAuthJson(authJson.value).pipe(Effect.option);
+    if (Option.isNone(parsed)) {
       return undefined;
     }
-    const token = grokAuthTokenFromJson(parsed, Date.now());
+    const token = grokAuthTokenFromJson(parsed.value, yield* Clock.currentTimeMillis);
     if (!token) {
       return undefined;
     }
